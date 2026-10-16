@@ -67,6 +67,7 @@ impl BindingStorage {
         // Publish the binding *before* marking it live: a reader observing `true` (with the corresponding `Acquire`-load) is then guaranteed to
         // see the fully-written binding.
         storage.initialized.store(true, Ordering::Release);
+        super::open_threaded_callback_admission();
     }
 
     /// Deinitialize the binding storage.
@@ -77,7 +78,8 @@ impl BindingStorage {
     /// # Panics
     /// If called while not initialized.
     pub unsafe fn deinitialize() {
-        // SAFETY: We only call this once no other operations happen anymore, i.e. no other access to the binding.
+        // SAFETY: Ordinary binding access has stopped. Explicitly admitted worker callbacks are the sole exception and are drained below
+        // before the ManualInitCell is cleared.
         let storage = unsafe { Self::storage() };
 
         assert!(
@@ -85,7 +87,11 @@ impl BindingStorage {
             "deinitialize without prior initialize"
         );
 
-        // Mark the binding not-live *before* clearing it: a reader observing `false` will not dereference the binding.
+        // Stop new scoped worker callbacks and retain the binding until every admitted callback has returned. This closes the check/use race
+        // between `get_binding_unchecked()` and clearing the backing ManualInitCell.
+        super::close_threaded_callback_admission_and_wait();
+
+        // Mark the binding not-live before clearing it. Ordinary main-thread access is already excluded by this function's safety contract.
         storage.initialized.store(false, Ordering::Release);
 
         // SAFETY: We are the only thread that can access the binding, and we know that it's initialized.
@@ -127,7 +133,7 @@ impl BindingStorage {
     #[inline(always)] // Runs on every FFI call. Failure path now outlined -> remaining body = load + predicted branch.
     pub(super) fn ensure_main_thread() {
         #[cfg(all(safeguards_balanced, not(wasm_nothreads)))]
-        if !crate::is_main_thread() {
+        if !super::is_in_threaded_callback() && !crate::is_main_thread() {
             #[cold]
             #[inline(never)] // Outlined error path.
             fn report_wrong_thread() {
@@ -151,7 +157,8 @@ impl BindingStorage {
     }
 }
 
-// SAFETY: We ensure that `binding` is only ever accessed from the same thread that initialized it.
+// SAFETY: ordinary access remains on the initialization thread. Explicit worker callbacks hold an admission lease for the lifetime of every
+// binding reference, and deinitialize closes admission and waits for those leases before clearing the cell.
 unsafe impl Sync for BindingStorage {}
-// SAFETY: We ensure that `binding` is only ever accessed from the same thread that initialized it.
+// SAFETY: same invariant as the Sync implementation above.
 unsafe impl Send for BindingStorage {}

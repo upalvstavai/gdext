@@ -670,6 +670,148 @@ use crate::util::{KvParser, bail, ident};
 /// }
 /// ```
 ///
+/// ## Experimental worker-thread callbacks
+///
+/// Some Godot extension interfaces, such as resource loaders and physics or audio servers, may invoke virtual methods from engine worker
+/// threads. Classes that implement such an interface can opt in with three explicit steps:
+///
+/// 1. `#[class(unsafe_threaded)]` selects blocking, cross-thread lifetime storage for that class.
+/// 2. An `unsafe impl` of [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html) accepts the complete safety contract.
+/// 3. Either `#[godot_api(unsafe_threaded)]` admits every regular virtual callback in one interface implementation, or
+///    `#[func(unsafe_threaded)]` admits one selected regular virtual in an ordinary `#[godot_api]` interface implementation.
+///
+/// This is callback-scoped. It does not permit arbitrary Rust threads to use this class or the Godot API, and it does not make `Gd`, `Base`,
+/// engine objects, or the scene tree thread-safe. Constructors and registration, `to_string`, notifications, property hooks, inherent
+/// `#[func]` methods, and unselected interface virtuals remain ordinary callbacks. Such ordinary callbacks may use `Base` under their normal
+/// main-thread contract. `#[func(unsafe_threaded)]` is accepted only on a regular engine virtual and cannot be combined with
+/// `#[func(gd_self)]`; an interface-wide opt-in likewise does not support virtuals using `#[func(gd_self)]`.
+///
+/// Every non-`Base<T>` field must implement `Send`. Access to one instance moves between OS threads serially: while one thread holds any
+/// borrow, another thread waits even for a shared borrow. Do not wait for an operation that can dispatch another callback to the same instance
+/// while holding its receiver or a bind guard. The unsafe contract also covers generated argument/return-value marshalling, synchronous
+/// re-entry, destruction on the thread releasing the last storage claim, and quiescing callback dispatch before extension unload. See the
+/// safety documentation on [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html) before opting in.
+///
+/// ```no_run
+/// use std::sync::Mutex;
+///
+/// use godot::classes::{IResourceFormatLoader, ResourceFormatLoader};
+/// use godot::prelude::*;
+///
+/// #[derive(GodotClass)]
+/// #[class(base = ResourceFormatLoader, unsafe_threaded)]
+/// struct WorkerLoader {
+///     requests: Mutex<u64>,
+///     base: Base<ResourceFormatLoader>,
+/// }
+///
+/// // SAFETY: the overridden virtuals' complete ABIs are valid in ResourceLoader workers; they use only synchronized Rust state and worker-safe
+/// // value marshalling, never access `base` or another Godot object, and neither `WorkerLoader` nor its fields call Godot from `Drop`. The owner
+/// // unregisters the loader and waits for outstanding loads before extension deinitialization.
+/// unsafe impl godot::obj::ThreadedGodotClass for WorkerLoader {}
+///
+/// #[godot_api(unsafe_threaded)]
+/// impl IResourceFormatLoader for WorkerLoader {
+///     fn init(base: Base<ResourceFormatLoader>) -> Self {
+///         Self {
+///             requests: Mutex::new(0),
+///             base,
+///         }
+///     }
+///
+///     fn get_recognized_extensions(&self) -> PackedStringArray {
+///         *self.requests.lock().unwrap() += 1;
+///         PackedStringArray::new()
+///     }
+///
+///     fn load(
+///         &self,
+///         _path: GString,
+///         _original_path: GString,
+///         _use_sub_threads: bool,
+///         _cache_mode: i32,
+///     ) -> Variant {
+///         *self.requests.lock().unwrap() += 1;
+///         Variant::nil()
+///     }
+/// }
+/// ```
+///
+/// The method-level form leaves unmarked virtuals under their ordinary callback contract. In this example, the integration's thread contract
+/// allows only `load` to run on a resource worker; `get_resource_type` stays unmarked and can therefore use the base object when Godot calls it
+/// on the main thread:
+///
+/// ```no_run
+/// use std::sync::atomic::{AtomicU64, Ordering};
+///
+/// use godot::classes::{IResourceFormatLoader, ResourceFormatLoader};
+/// use godot::prelude::*;
+///
+/// #[derive(GodotClass)]
+/// #[class(base = ResourceFormatLoader, unsafe_threaded)]
+/// struct SelectiveLoader {
+///     loads: AtomicU64,
+///     base: Base<ResourceFormatLoader>,
+/// }
+///
+/// // SAFETY: only `load` is selected below, and its complete callback ABI uses worker-safe values and synchronized Rust state. The owner
+/// // stops and drains worker loads before unloading the extension, and dropping this class does not call Godot.
+/// unsafe impl godot::obj::ThreadedGodotClass for SelectiveLoader {}
+///
+/// #[godot_api]
+/// impl IResourceFormatLoader for SelectiveLoader {
+///     fn init(base: Base<ResourceFormatLoader>) -> Self {
+///         Self {
+///             loads: AtomicU64::new(0),
+///             base,
+///         }
+///     }
+///
+///     fn get_resource_type(&self, _path: GString) -> GString {
+///         // This unmarked virtual keeps the ordinary main-thread contract.
+///         self.base().get_class()
+///     }
+///
+///     #[func(unsafe_threaded)]
+///     fn load(
+///         &self,
+///         _path: GString,
+///         _original_path: GString,
+///         _use_sub_threads: bool,
+///         _cache_mode: i32,
+///     ) -> Variant {
+///         self.loads.fetch_add(1, Ordering::Relaxed);
+///         Variant::nil()
+///     }
+/// }
+/// ```
+///
+/// A method can keep its ordinary callback contract on a target without worker-thread dispatch by applying the method and class opt-ins under
+/// the same configuration. The conditional method form is deliberately limited to `cfg_attr(condition, func(unsafe_threaded))`; the unsafe
+/// trait implementation must use that condition as well:
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[cfg_attr(not(target_arch = "wasm32"), class(base = Node, init, unsafe_threaded))]
+/// #[cfg_attr(target_arch = "wasm32", class(base = Node, init))]
+/// struct PortableNode;
+///
+/// #[cfg(not(target_arch = "wasm32"))]
+/// unsafe impl godot::obj::ThreadedGodotClass for PortableNode {}
+///
+/// #[godot_api]
+/// impl INode for PortableNode {
+///     #[cfg_attr(not(target_arch = "wasm32"), func(unsafe_threaded))]
+///     fn process(&mut self, _delta: f64) {}
+/// }
+/// ```
+///
+/// `lazy-function-tables` is incompatible with this opt-in and causes a compile-time error. Enabling the global `experimental-threads` feature
+/// does not replace the class attribute, unsafe trait implementation, or callback selection. Prefer the default storage unless Godot itself
+/// invokes the selected extension virtuals off the main thread. This API is experimental and may change as Godot exposes more precise
+/// thread-safety metadata.
+///
 ///
 /// # Further field customization
 ///
@@ -755,7 +897,8 @@ use crate::util::{KvParser, bail, ident};
     alias = "export",
     alias = "tool",
     alias = "rename",
-    alias = "internal"
+    alias = "internal",
+    alias = "unsafe_threaded"
 )]
 #[proc_macro_derive(
     GodotClass,
@@ -806,6 +949,74 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// See also [book chapter _Registering functions_](https://godot-rust.github.io/book/register/functions.html) and following.
 ///
 /// **See sidebar on the left for table of contents.**
+///
+/// # Experimental worker-thread interface virtuals
+///
+/// `#[godot_api(unsafe_threaded)]` is accepted only on an engine interface trait implementation. It admits every regular virtual trampoline in
+/// that implementation for calls from Godot worker threads. For a narrower boundary, use an ordinary `#[godot_api]` implementation and put
+/// `#[func(unsafe_threaded)]` on each selected regular virtual. Unmarked virtuals remain ordinary callbacks and may use `Base` under their
+/// normal main-thread contract.
+///
+/// Neither callback-selection form admits constructors or registration, `to_string`, notifications, property hooks, or exported inherent
+/// `#[func]` callbacks. The method-level marker is rejected on those special callbacks, and it cannot be combined with `#[func(gd_self)]`;
+/// interface-wide selection likewise does not support a regular virtual using `#[func(gd_self)]`.
+///
+/// Callback selection is only one part of the opt-in: the class also needs `#[class(unsafe_threaded)]` and an explicit unsafe implementation
+/// of [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html). The unsafe contract covers each selected callback's complete generated ABI,
+/// including argument and return-value marshalling, value destruction, synchronous re-entry, and extension teardown. See
+/// [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html) for the requirements and [`GodotClass`] for a complete three-part example.
+/// The global `experimental-threads` feature does not replace these opt-ins, and `lazy-function-tables` is incompatible with them.
+///
+/// A method-level opt-in without the class-level storage opt-in is rejected:
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base = Node)]
+/// struct MissingClassOptIn;
+///
+/// unsafe impl godot::obj::ThreadedGodotClass for MissingClassOptIn {}
+///
+/// #[godot_api]
+/// impl INode for MissingClassOptIn {
+///     #[func(unsafe_threaded)]
+///     fn process(&mut self, _delta: f64) {}
+/// }
+/// ```
+///
+/// Special callbacks cannot be selected individually:
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base = Node, unsafe_threaded)]
+/// struct InvalidSpecialCallback;
+///
+/// unsafe impl godot::obj::ThreadedGodotClass for InvalidSpecialCallback {}
+///
+/// #[godot_api]
+/// impl INode for InvalidSpecialCallback {
+///     #[func(unsafe_threaded)]
+///     fn on_notification(&mut self, _what: ObjectNotification) {}
+/// }
+/// ```
+///
+/// A selected virtual also cannot use a `Gd<Self>` receiver:
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base = Node, unsafe_threaded)]
+/// struct InvalidGdSelf;
+///
+/// unsafe impl godot::obj::ThreadedGodotClass for InvalidGdSelf {}
+///
+/// #[godot_api]
+/// impl INode for InvalidGdSelf {
+///     #[func(unsafe_threaded, gd_self)]
+///     fn ready(_this: Gd<Self>) {}
+/// }
+/// ```
 ///
 /// # Constructors
 /// Note that `init` (the Godot default constructor) can be either provided by overriding it, or generated with a `#[class(init)]` attribute
@@ -1293,7 +1504,8 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
     alias = "constant",
     alias = "rename",
     alias = "secondary",
-    alias = "internal"
+    alias = "internal",
+    alias = "unsafe_threaded"
 )]
 #[proc_macro_attribute]
 pub fn godot_api(meta: TokenStream, input: TokenStream) -> TokenStream {

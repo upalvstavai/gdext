@@ -5,6 +5,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+mod instance_registry;
 mod instance_storage;
 #[cfg_attr(not(feature = "experimental-threads"), allow(dead_code))]
 mod multi_threaded;
@@ -72,17 +73,20 @@ mod log_active {
     }
 
     pub fn log_inc_ref<T: StorageRefCounted>(storage: &T) {
+        // Refcount notifications may run on a Godot worker thread for explicitly threaded classes. Do not Debug-format Base here: its Debug
+        // implementation queries dynamic engine state through FFI. The instance ID is cached in Base and needs no engine call.
         out!(
-            "    Storage::on_inc_ref:  {base:?}  (T={ty})",
-            base = storage.base(),
+            "    Storage::on_inc_ref:  {base_id}  (T={ty})",
+            base_id = storage.base().instance_id_unchecked(),
             ty = type_name::<T>(),
         );
     }
 
     pub fn log_dec_ref<T: StorageRefCounted>(storage: &T) {
+        // Same worker-thread restriction as `log_inc_ref`.
         out!(
-            "  | Storage::on_dec_ref:  {base:?}  (T={ty})",
-            base = storage.base(),
+            "  | Storage::on_dec_ref:  {base_id}  (T={ty})",
+            base_id = storage.base().instance_id_unchecked(),
             ty = type_name::<T>(),
         );
     }

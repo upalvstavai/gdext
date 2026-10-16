@@ -967,9 +967,15 @@ pub fn get_class_extra_docs(class_name: &TyName) -> Option<&'static str> {
             "Use this in combination with the [`obj::script` module][crate::obj::script]."
         }
         "ResourceFormatLoader" => {
-            "Enable the `experimental-threads` feature when using custom `ResourceFormatLoader`s. \
-            Otherwise the application will panic when the custom `ResourceFormatLoader` is used by Godot \
-            in a thread other than the main thread."
+            "Godot may invoke custom `ResourceFormatLoader` virtual methods from resource worker threads. \
+            A loader which accepts that unsafe contract must use all three explicit opt-ins: \
+            `#[class(unsafe_threaded)]`, an `unsafe impl` of \
+            [`ThreadedGodotClass`](crate::obj::ThreadedGodotClass), and callback selection. Use \
+            `#[godot_api(unsafe_threaded)]` on `IResourceFormatLoader` when every regular virtual in the implementation is safe in a worker, \
+            or use `#[func(unsafe_threaded)]` on only the regular virtual methods Godot may invoke there. Unselected methods remain ordinary \
+            callbacks and may use `Base` under their normal main-thread contract. The opt-in does not make arbitrary Godot APIs thread-safe. \
+            The global `experimental-threads` feature does not replace these opt-ins. See \
+            [`ThreadedGodotClass`](crate::obj::ThreadedGodotClass) for the complete safety contract."
         }
         "WeakRef" => {
             "It's almost never a good idea to use this class. You can use instance IDs as _weak references_, and upgrade to strong references \

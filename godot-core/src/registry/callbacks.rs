@@ -21,11 +21,13 @@ use crate::builder::ClassBuilder;
 use crate::builtin::{StringName, Variant};
 use crate::classes::Object;
 use crate::meta::ClassId;
-use crate::obj::{AsDyn, Base, Bounds, Gd, GodotClass, Inherits, UserClass, bounds, cap};
+use crate::obj::{
+    AsDyn, Base, Bounds, ClassThreading, Gd, GodotClass, Inherits, UserClass, bounds, cap,
+};
 use crate::private::{IntoVirtualMethodReceiver, PanicPayload, handle_panic};
 use crate::registry::info::PropertyInfo;
 use crate::registry::shard::ErasedDynGd;
-use crate::storage::{InstanceStorage, Storage, StorageRefCounted, as_storage, as_weak_storage};
+use crate::storage::{InstanceStorage, Storage, StorageRefCounted, as_storage, try_as_storage};
 
 struct MethodCallContext<'a> {
     class_id: ClassId,
@@ -199,8 +201,10 @@ where
     );
 
     let instance = InstanceStorage::<T>::construct(user_instance, base);
-    let instance_rust_ptr = instance.into_raw();
-    let instance_ptr = instance_rust_ptr as sys::GDExtensionClassInstancePtr;
+    let instance_ptr = handle_panic(
+        &context,
+        std::panic::AssertUnwindSafe(|| instance.into_instance_ptr()),
+    )?;
 
     let binding_data_callbacks = crate::storage::nop_instance_callbacks();
     unsafe {
@@ -244,14 +248,23 @@ pub unsafe extern "C" fn free<T: GodotClass>(
     _class_user_data: *mut std::ffi::c_void,
     instance: sys::GDExtensionClassInstancePtr,
 ) {
-    // SAFETY: Pointer valid for callback duration (Godot contract).
-    unsafe {
-        {
-            let storage = as_weak_storage::<T>(instance);
-            storage.mark_destroyed_by_godot();
-        } // Ref no longer valid once next statement is executed.
-
-        crate::storage::release_godot_claim::<T>(instance);
+    match T::__THREADING {
+        ClassThreading::SingleThreaded => {
+            // SAFETY: pointer is valid for the callback duration (Godot contract), and this callback is confined to the binding thread.
+            unsafe { crate::storage::release_godot_claim::<T>(instance) };
+        }
+        ClassThreading::Blocking => {
+            // A blocking object's free callback may run on a Godot worker. Pin the binding for the complete callback because destruction
+            // diagnostics can print through a reviewed thread-safe interface after startup messages have already been flushed.
+            // SAFETY: blocking storage is selected either by the explicit `ThreadedGodotClass` contract or by the process-wide
+            // `experimental-threads` contract. Destruction must therefore be worker-safe; this callback uses only registry synchronization
+            // and the reviewed thread-safe diagnostic path.
+            unsafe {
+                sys::with_threaded_callback_admission(|_| {
+                    crate::storage::release_godot_claim::<T>(instance)
+                })
+            };
+        }
     }
 }
 
@@ -386,13 +399,49 @@ pub unsafe extern "C" fn set<T: cap::GodotSet>(
 }
 
 pub unsafe extern "C" fn reference<T: GodotClass>(instance: sys::GDExtensionClassInstancePtr) {
-    let storage = unsafe { as_weak_storage::<T>(instance) };
-    storage.on_inc_ref();
+    match T::__THREADING {
+        ClassThreading::SingleThreaded => {
+            if let Some(storage) = unsafe { try_as_storage::<T>(instance) } {
+                storage.on_inc_ref();
+            }
+        }
+        ClassThreading::Blocking => {
+            // A refcount notification may overlap both `free` and binding teardown. The storage claim prevents `free` from deallocating the
+            // Rust instance, while the outer admission lease prevents binding teardown/library unload from completing before this callback
+            // (including a possible last-claim `Drop`) returns. If close linearized first, the weak lookup simply finds no live storage.
+            // SAFETY: blocking storage is selected either by the explicit `ThreadedGodotClass` contract or by the process-wide
+            // `experimental-threads` contract. This callback uses registry synchronization only and does not grant general worker FFI access.
+            unsafe {
+                sys::with_threaded_callback_admission(|_| {
+                    if let Some(storage) = try_as_storage::<T>(instance) {
+                        storage.on_inc_ref();
+                    }
+                })
+            };
+        }
+    }
 }
 
 pub unsafe extern "C" fn unreference<T: GodotClass>(instance: sys::GDExtensionClassInstancePtr) {
-    let storage = unsafe { as_weak_storage::<T>(instance) };
-    storage.on_dec_ref();
+    match T::__THREADING {
+        ClassThreading::SingleThreaded => {
+            if let Some(storage) = unsafe { try_as_storage::<T>(instance) } {
+                storage.on_dec_ref();
+            }
+        }
+        ClassThreading::Blocking => {
+            // See `reference`: the admission lease must outlive the storage claim because `on_dec_ref` can release the last claim and run
+            // user `Drop` on this thread.
+            // SAFETY: same contract as the blocking `reference` path.
+            unsafe {
+                sys::with_threaded_callback_admission(|_| {
+                    if let Some(storage) = try_as_storage::<T>(instance) {
+                        storage.on_dec_ref();
+                    }
+                })
+            };
+        }
+    }
 }
 
 /// # Safety

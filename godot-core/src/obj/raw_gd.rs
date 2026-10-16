@@ -18,8 +18,10 @@ use crate::meta::shape::GodotShape;
 use crate::meta::{ClassId, FromGodot, GodotConvert, GodotFfiVariant, GodotType, RefArg, ToGodot};
 use crate::obj::bounds::{Declarer, DynMemory as _, Memory};
 use crate::obj::rtti::ObjectRtti;
-use crate::obj::{Bounds, Gd, GdDerefTarget, GdMut, GdRef, GodotClass, InstanceId, bounds};
-use crate::storage::{InstanceCache, InstanceStorage, Storage};
+use crate::obj::{
+    Bounds, ClassThreading, Gd, GdDerefTarget, GdMut, GdRef, GodotClass, InstanceId, bounds,
+};
+use crate::storage::{InstanceCache, InstanceStorage, StorageClaim};
 use crate::{classes, meta, out};
 
 /// Low-level bindings for object pointers in Godot.
@@ -34,8 +36,8 @@ pub struct RawGd<T: GodotClass> {
     // Must not be changed after initialization.
     cached_rtti: Option<ObjectRtti>,
 
-    // Direct access to InstanceStorage -- initially null.
-    // Only set for user-defined types; ZST otherwise.
+    // Cached direct InstanceStorage pointer for single-threaded user classes -- initially null. Blocking classes deliberately leave it null
+    // because their opaque handle can change across hot reload. ZST for engine-defined types.
     cached_storage_ptr: <<T as Bounds>::Declarer as Declarer>::InstanceCache,
 }
 
@@ -486,10 +488,16 @@ where
     // Note: possible names: write/read, hold/hold_mut, r/w, r/rw, ...
     pub(crate) fn bind(&self) -> GdRef<'_, T> {
         self.check_rtti("bind");
-        let storage = self
-            .storage()
-            .unwrap_or_else(|| classes::panic_placeholder_bind::<T>("bind"));
-        GdRef::from_guard(storage.get())
+        let instance_ptr = self.resolve_instance_ptr();
+        if instance_ptr.is_null() {
+            classes::panic_placeholder_bind::<T>("bind");
+        }
+
+        // SAFETY: `check_rtti()` validated the object and `instance_ptr` is its extension instance pointer. The returned claim pins the
+        // storage for the full lifetime of the guard, including while a blocking borrow waits on another thread.
+        let claim = unsafe { crate::storage::try_as_storage::<T>(instance_ptr) }
+            .unwrap_or_else(|| panic!("Gd<T>::bind() called after instance destruction began"));
+        GdRef::from_claim(claim)
     }
 
     /// Hands out a guard for an exclusive borrow, through which the user instance can be read and written.
@@ -497,21 +505,30 @@ where
     /// See [`Gd::bind_mut()`] for a more in depth explanation.
     pub(crate) fn bind_mut(&mut self) -> GdMut<'_, T> {
         self.check_rtti("bind_mut");
-        let storage = self
-            .storage()
-            .unwrap_or_else(|| classes::panic_placeholder_bind::<T>("bind_mut"));
-        GdMut::from_guard(storage.get_mut())
+        let instance_ptr = self.resolve_instance_ptr();
+        if instance_ptr.is_null() {
+            classes::panic_placeholder_bind::<T>("bind_mut");
+        }
+
+        // SAFETY: same argument as `bind()` above.
+        let claim = unsafe { crate::storage::try_as_storage::<T>(instance_ptr) }
+            .unwrap_or_else(|| panic!("Gd<T>::bind_mut() called after instance destruction began"));
+        GdMut::from_claim(claim)
     }
 
     /// Storage object associated with the extension instance.
     ///
-    /// Returns `None` if self is null.
-    pub(crate) fn storage(&self) -> Option<&InstanceStorage<T>> {
-        // SAFETY:
-        // - We have a `&self`, so the storage must already have been created.
-        // - The storage cannot be destroyed while we have a `&self` reference, so it will not be
-        //   destroyed for the duration of `'a`.
-        unsafe { self.storage_unbounded() }
+    /// Returns `None` if self is null, is an editor placeholder without Rust storage, or destruction already closed claim admission.
+    pub(crate) fn storage(&self) -> Option<StorageClaim<T>> {
+        let instance_ptr = self.resolve_instance_ptr();
+        if instance_ptr.is_null() {
+            return None;
+        }
+
+        // SAFETY: `instance_ptr` is the binding returned by Godot for this object. In particular, blocking storage resolves the opaque handle
+        // and acquires its lifetime claim while holding the registry read lock; a mere `&RawGd` does not otherwise pin a manually managed
+        // object's Rust storage against concurrent destruction.
+        unsafe { crate::storage::try_as_storage::<T>(instance_ptr) }
     }
 
     /// Storage object associated with the extension instance.
@@ -533,7 +550,9 @@ where
         // The caller is responsible for ensuring that the storage is live for the duration of the lifetime
         // `'b`.
         //
-        // Potential issue is a concurrent free() in multi-threaded access; but that would need to be guarded against inside free().
+        // For blocking storage, resolving the opaque handle itself cannot race deallocation: removal takes the registry write lock. The
+        // returned reference is deliberately unclaimed, though, so the caller's lifetime proof must independently keep a claim alive after
+        // the lookup lock is released (as `WithBaseField::base_mut()` does through its existing `&mut self`).
         unsafe {
             let binding = self.resolve_instance_ptr();
             sys::ptr_then(binding, |binding| {
@@ -562,9 +581,14 @@ where
             return ptr::null_mut();
         }
 
-        let cached = self.cached_storage_ptr.get();
-        if !cached.is_null() {
-            return cached;
+        // A blocking class uses a never-reused opaque registry handle. Hot reload replaces that handle when the Rust part is recreated, so
+        // caching it in a long-lived `Gd` could permanently resolve the old, closed instance. Single-threaded classes retain the direct-pointer
+        // fast path and its existing cache behavior.
+        if T::__THREADING == ClassThreading::SingleThreaded {
+            let cached = self.cached_storage_ptr.get();
+            if !cached.is_null() {
+                return cached;
+            }
         }
 
         let callbacks = crate::storage::nop_instance_callbacks();
@@ -583,7 +607,9 @@ where
         #[cfg(safeguards_strict)]
         crate::classes::ensure_binding_not_null::<T>(ptr);
 
-        self.cached_storage_ptr.set(ptr);
+        if T::__THREADING == ClassThreading::SingleThreaded {
+            self.cached_storage_ptr.set(ptr);
+        }
         ptr
     }
 }

@@ -12,6 +12,14 @@ use crate::ParseResult;
 use crate::class::{transform_inherent_impl, transform_trait_impl};
 use crate::util::{KvParser, bail, venial_parse_meta};
 
+fn parse_trait_impl_attr(meta: TokenStream) -> Result<bool, venial::Error> {
+    let item = venial_parse_meta(&meta, format_ident!("godot_api"), &quote! { fn func(); })?;
+    let mut attr = KvParser::parse_required(item.attributes(), "godot_api", &meta)?;
+    let unsafe_threaded = attr.handle_alone("unsafe_threaded")?;
+    attr.finish()?;
+    Ok(unsafe_threaded)
+}
+
 fn parse_inherent_impl_attr(meta: TokenStream) -> Result<super::InherentImplAttr, venial::Error> {
     let item = venial_parse_meta(&meta, format_ident!("godot_api"), &quote! { fn func(); })?;
     let mut attr = KvParser::parse_required(item.attributes(), "godot_api", &meta)?;
@@ -64,15 +72,8 @@ pub fn attribute_godot_api(
     };
 
     if decl.trait_ty.is_some() {
-        // 'meta' contains the parameters to the macro, that is, for `#[godot_api(a, b, x=y)]`, anything inside the braces.
-        // We currently don't accept any parameters for a trait `impl`, so show an error to the user if they added something there.
-        if meta.to_string() != "" {
-            return bail!(
-                meta,
-                "#[godot_api] on a trait implementation currently does not support any parameters"
-            );
-        }
-        transform_trait_impl(decl)
+        let unsafe_threaded = parse_trait_impl_attr(meta)?;
+        transform_trait_impl(decl, unsafe_threaded)
     } else {
         match parse_inherent_impl_attr(meta) {
             Ok(meta) => transform_inherent_impl(meta, decl, self_path),

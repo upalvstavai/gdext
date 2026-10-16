@@ -5,7 +5,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use proc_macro2::{Delimiter, Group, Ident, TokenStream};
+use proc_macro2::{Delimiter, Group, Ident, TokenStream, TokenTree};
 use quote::{ToTokens, format_ident, quote};
 
 use crate::class::data_models::func::validate_receiver_extract_gdself;
@@ -17,7 +17,10 @@ use crate::{ParseResult, util};
 ///
 /// The `handle_*` methods and `Decls` fields are named after the user-facing `I*` virtual; see `godot_core::registry` for the naming rule
 /// across all layers.
-pub fn transform_trait_impl(mut original_impl: venial::Impl) -> ParseResult<TokenStream> {
+pub fn transform_trait_impl(
+    mut original_impl: venial::Impl,
+    unsafe_threaded: bool,
+) -> ParseResult<TokenStream> {
     let (class_name, trait_path, trait_base_class) =
         util::validate_trait_impl_virtual(&original_impl, "godot_api")?;
 
@@ -45,7 +48,24 @@ pub fn transform_trait_impl(mut original_impl: venial::Impl) -> ParseResult<Toke
         // To remove deprecation support, delete this call and the function it references.
         deprecation_warnings.extend(maybe_rename_deprecated_virtual(method));
 
-        let is_gd_self = is_gd_self(&method.attributes)?;
+        let func_attr = parse_virtual_func_attr(&method.attributes)?;
+        let is_gd_self = func_attr.gd_self;
+        let method_threading = func_attr.threading;
+        if (unsafe_threaded || method_threading.can_run_threaded()) && is_gd_self {
+            return bail!(
+                method,
+                "threaded virtual callbacks do not support #[func(gd_self)]"
+            );
+        }
+
+        // `#[func]` is consumed by this attribute macro. Leaving a method-level `#[func(unsafe_threaded)]` on the emitted Rust trait impl would
+        // make rustc try to resolve it as an unrelated attribute after expansion.
+        let mut attr_index = 0usize;
+        method.attributes.retain(|_| {
+            let retain = !func_attr.consumed_attribute_indices.contains(&attr_index);
+            attr_index += 1;
+            retain
+        });
         // Methods with gd_self will be rewritten outside trait.
         if is_gd_self {
             removed_methods_idx.push(index);
@@ -60,27 +80,46 @@ pub fn transform_trait_impl(mut original_impl: venial::Impl) -> ParseResult<Toke
         let method_name_str = method.name.to_string();
         match method_name_str.as_str() {
             "register_class" => {
+                validate_not_method_threaded(&method_threading, method)?;
                 validate_not_gd_self(is_gd_self, method)?;
                 iface.handle_register_class(cfg_attrs);
             }
             "init" => {
+                validate_not_method_threaded(&method_threading, method)?;
                 validate_not_gd_self(is_gd_self, method)?;
                 iface.handle_init(cfg_attrs);
             }
             "to_string" => {
+                validate_not_method_threaded(&method_threading, method)?;
                 iface.handle_to_string(cfg_attrs, is_gd_self);
             }
             "on_notification" => {
+                validate_not_method_threaded(&method_threading, method)?;
                 // POSTINIT notification can't be handled with the gd_self receiver
                 // since object will not be yet constructed.
                 validate_not_gd_self(is_gd_self, method)?;
                 iface.handle_on_notification(cfg_attrs);
             }
-            "on_get" => iface.handle_on_get(cfg_attrs, is_gd_self),
-            "on_set" => iface.handle_on_set(cfg_attrs, is_gd_self),
-            "on_validate_property" => iface.handle_on_validate_property(cfg_attrs, is_gd_self),
-            "on_get_property_list" => iface.handle_on_get_property_list(cfg_attrs, is_gd_self),
-            "on_property_get_revert" => iface.handle_on_property_get_revert(cfg_attrs, is_gd_self),
+            "on_get" => {
+                validate_not_method_threaded(&method_threading, method)?;
+                iface.handle_on_get(cfg_attrs, is_gd_self);
+            }
+            "on_set" => {
+                validate_not_method_threaded(&method_threading, method)?;
+                iface.handle_on_set(cfg_attrs, is_gd_self);
+            }
+            "on_validate_property" => {
+                validate_not_method_threaded(&method_threading, method)?;
+                iface.handle_on_validate_property(cfg_attrs, is_gd_self);
+            }
+            "on_get_property_list" => {
+                validate_not_method_threaded(&method_threading, method)?;
+                iface.handle_on_get_property_list(cfg_attrs, is_gd_self);
+            }
+            "on_property_get_revert" => {
+                validate_not_method_threaded(&method_threading, method)?;
+                iface.handle_on_property_get_revert(cfg_attrs, is_gd_self);
+            }
             regular_virtual_fn => {
                 // All the non-special engine ones: ready(), process(), etc.
                 // Can modify original_impl, concretely the fn body for f64->f32 conversions.
@@ -89,6 +128,7 @@ pub fn transform_trait_impl(mut original_impl: venial::Impl) -> ParseResult<Toke
                     regular_virtual_fn,
                     cfg_attrs,
                     is_gd_self,
+                    method_threading,
                 )?;
 
                 // If the function is modified (e.g. process() declared with f32), apply changes here.
@@ -119,6 +159,7 @@ pub fn transform_trait_impl(mut original_impl: venial::Impl) -> ParseResult<Toke
             signature_info: SignatureInfo::fn_ready(),
             before_kind: BeforeKind::OnlyBefore,
             interface_trait: None,
+            threading: VirtualThreading::Ordinary,
         };
 
         decls.overridden_virtuals.push(match_arm);
@@ -154,13 +195,68 @@ pub fn transform_trait_impl(mut original_impl: venial::Impl) -> ParseResult<Toke
     let virtual_match_arms = decls
         .overridden_virtuals
         .iter()
-        .map(|v| v.make_match_arm(&class_name, &trait_base_class));
+        .map(|v| v.make_match_arm(&class_name, &trait_base_class, unsafe_threaded));
+
+    // Keep method-level contract checks under the same `#[cfg]` as their virtual. A disabled
+    // method must not force an otherwise ordinary class to opt into worker-thread storage.
+    // Interface-level opt-in remains unconditional because the attribute applies to the impl
+    // itself, including every regular virtual which is enabled in that build.
+    let make_threaded_contract_check =
+        |cfg_attrs: &[&venial::Attribute], conditional_cfg: Option<&TokenStream>| {
+            let conditional_attr = conditional_cfg.map(|condition| quote! { #[cfg(#condition)] });
+            quote! {
+                #(#cfg_attrs)*
+                #conditional_attr
+                const _: () = {
+                    fn __godot_require_threaded_contract<T: ::godot::obj::ThreadedGodotClass>() {}
+
+                    fn __godot_check_threaded_interface_contract() {
+                        __godot_require_threaded_contract::<#class_name>();
+                    }
+
+                    assert!(
+                        ::godot::sys::UNSAFE_THREADED_CALLBACKS_SUPPORTED,
+                        "threaded virtual callbacks are incompatible with lazy-function-tables"
+                    );
+
+                    assert!(
+                        <#class_name as ::godot::obj::GodotClass>::__UNSAFE_THREADED_OPT_IN,
+                        "threaded virtual callbacks require an explicit #[class(unsafe_threaded)] opt-in"
+                    );
+
+                    match <#class_name as ::godot::obj::GodotClass>::__THREADING {
+                        ::godot::obj::ClassThreading::Blocking => (),
+                        ::godot::obj::ClassThreading::SingleThreaded => {
+                            panic!("threaded virtual callbacks require #[class(unsafe_threaded)]")
+                        }
+                    }
+                };
+            }
+        };
+
+    let threaded_contract_check = if unsafe_threaded {
+        make_threaded_contract_check(&[], None)
+    } else {
+        decls
+            .overridden_virtuals
+            .iter()
+            .filter(|virtual_fn| virtual_fn.threading.can_run_threaded())
+            .map(|virtual_fn| {
+                make_threaded_contract_check(
+                    &virtual_fn.cfg_attrs,
+                    virtual_fn.threading.conditional_cfg(),
+                )
+            })
+            .collect()
+    };
 
     let mut result = quote! {
         // #original_impl and gd_self_impls are inserted below.
         #decls
 
         impl ::godot::private::You_forgot_the_attribute__godot_api for #class_name {}
+
+        #threaded_contract_check
 
         impl ::godot::obj::cap::ImplementsGodotVirtual for #class_name {
             fn __virtual_call(name: &str, #hash_param) -> ::godot::sys::GDExtensionClassCallVirtual {
@@ -445,6 +541,7 @@ impl<'a> InterfaceBuilder<'a> {
         method_name: &str,
         cfg_attrs: Vec<&'a venial::Attribute>,
         has_gd_self: bool,
+        threading: VirtualThreading,
     ) -> ParseResult<Option<(venial::Punctuated<venial::FnParam>, Group)>> {
         // Fresh ident for generated code (`virtuals::method_name` constant lookup).
         // Using original span would cause IDE to show wrong semantic color for the original function definition.
@@ -530,6 +627,7 @@ impl<'a> InterfaceBuilder<'a> {
             signature_info,
             before_kind,
             interface_trait: Some(self.trait_path.clone()),
+            threading,
         });
 
         Ok(updated_function)
@@ -620,14 +718,136 @@ fn make_inactive_class_check(_return_value: TokenStream) -> TokenStream {
     TokenStream::new()
 }
 
-fn is_gd_self(attributes: &[venial::Attribute]) -> ParseResult<bool> {
-    match KvParser::parse(attributes, "func")? {
-        Some(mut parser) => {
-            let has_gd_self = parser.handle_alone("gd_self")?;
-            parser.finish()?;
-            Ok(has_gd_self)
+#[derive(Clone, Default)]
+struct VirtualFuncAttr {
+    gd_self: bool,
+    threading: VirtualThreading,
+    consumed_attribute_indices: Vec<usize>,
+}
+
+fn parse_virtual_func_attr(attributes: &[venial::Attribute]) -> ParseResult<VirtualFuncAttr> {
+    let mut result = VirtualFuncAttr::default();
+
+    let has_direct_func = if let Some(mut parser) = KvParser::parse(attributes, "func")? {
+        result.gd_self = parser.handle_alone("gd_self")?;
+        result.threading = if parser.handle_alone("unsafe_threaded")? {
+            VirtualThreading::Always
+        } else {
+            VirtualThreading::Ordinary
+        };
+        parser.finish()?;
+        true
+    } else {
+        false
+    };
+
+    for (index, attr) in attributes.iter().enumerate() {
+        if attr
+            .get_single_path_segment()
+            .is_some_and(|name| name == "func")
+        {
+            result.consumed_attribute_indices.push(index);
+            continue;
         }
-        _ => Ok(false),
+
+        let Some(condition) = parse_cfg_attr_threaded_func(attr)? else {
+            continue;
+        };
+
+        if has_direct_func || !result.consumed_attribute_indices.is_empty() {
+            return bail!(
+                attr,
+                "only one direct or conditional #[func(...)] attribute is allowed"
+            );
+        }
+
+        result.threading = VirtualThreading::Conditional(condition);
+        result.consumed_attribute_indices.push(index);
+    }
+
+    Ok(result)
+}
+
+/// Parses the deliberately narrow form
+/// `#[cfg_attr(condition, func(unsafe_threaded))]`.
+///
+/// This lets a library retain an ordinary virtual on single-threaded targets while selecting
+/// the worker-thread contract for the same virtual elsewhere. Other `cfg_attr` attributes are
+/// left untouched for rustc.
+fn parse_cfg_attr_threaded_func(attr: &venial::Attribute) -> ParseResult<Option<TokenStream>> {
+    if attr
+        .get_single_path_segment()
+        .is_none_or(|name| name != "cfg_attr")
+    {
+        return Ok(None);
+    }
+
+    let venial::AttributeValue::Group(_, tokens) = &attr.value else {
+        return Ok(None);
+    };
+
+    let Some(comma_index) = tokens
+        .iter()
+        .position(|token| matches!(token, TokenTree::Punct(punct) if punct.as_char() == ','))
+    else {
+        return Ok(None);
+    };
+
+    let nested = &tokens[comma_index + 1..];
+    let contains_func = nested
+        .iter()
+        .any(|token| matches!(token, TokenTree::Ident(ident) if ident == "func"));
+    if !contains_func {
+        return Ok(None);
+    }
+
+    let [TokenTree::Ident(func), TokenTree::Group(options)] = nested else {
+        return bail!(
+            attr,
+            "conditional #[func] must use exactly #[cfg_attr(condition, func(unsafe_threaded))]"
+        );
+    };
+    if func != "func" || options.delimiter() != Delimiter::Parenthesis {
+        return bail!(
+            attr,
+            "conditional #[func] must use exactly #[cfg_attr(condition, func(unsafe_threaded))]"
+        );
+    }
+
+    let option_tokens = options.stream().into_iter().collect::<Vec<_>>();
+    let is_unsafe_threaded_only = matches!(
+        option_tokens.as_slice(),
+        [TokenTree::Ident(option)] if option == "unsafe_threaded"
+    );
+    if !is_unsafe_threaded_only {
+        return bail!(
+            attr,
+            "conditional #[func] currently supports only func(unsafe_threaded)"
+        );
+    }
+
+    let condition = tokens[..comma_index]
+        .iter()
+        .cloned()
+        .collect::<TokenStream>();
+    if condition.is_empty() {
+        return bail!(attr, "conditional #[func] requires a cfg condition");
+    }
+
+    Ok(Some(condition))
+}
+
+fn validate_not_method_threaded(
+    threading: &VirtualThreading,
+    method: &venial::Function,
+) -> ParseResult<()> {
+    if threading.can_run_threaded() {
+        bail!(
+            &method,
+            "#[func(unsafe_threaded)] can only be used on regular engine virtual methods"
+        )
+    } else {
+        Ok(())
     }
 }
 
@@ -655,25 +875,116 @@ struct OverriddenVirtualFn<'a> {
     signature_info: SignatureInfo,
     before_kind: BeforeKind,
     interface_trait: Option<venial::TypeExpr>,
+    /// Whether only this virtual, rather than the complete interface implementation, accepts worker-thread dispatch.
+    threading: VirtualThreading,
 }
 
 impl OverriddenVirtualFn<'_> {
-    fn make_match_arm(&self, class_name: &Ident, trait_base_class: &Ident) -> TokenStream {
-        let cfg_attrs = self.cfg_attrs.iter();
+    fn make_match_arm(
+        &self,
+        class_name: &Ident,
+        trait_base_class: &Ident,
+        unsafe_threaded: bool,
+    ) -> TokenStream {
         let godot_name_hash_constant = &self.godot_name_hash_constant;
 
         // Lazily generate code for the actual work (calling user function).
-        let method_callback = make_virtual_callback(
-            class_name,
-            trait_base_class,
-            &self.signature_info,
-            self.before_kind,
-            self.interface_trait.as_ref(),
-        );
+        if unsafe_threaded {
+            let cfg_attrs = self.cfg_attrs.iter();
+            let method_callback = make_virtual_callback(
+                class_name,
+                trait_base_class,
+                &self.signature_info,
+                self.before_kind,
+                self.interface_trait.as_ref(),
+                true,
+            );
+            return quote! {
+                #(#cfg_attrs)*
+                #godot_name_hash_constant => #method_callback,
+            };
+        }
 
-        quote! {
-            #(#cfg_attrs)*
-            #godot_name_hash_constant => #method_callback,
+        match &self.threading {
+            VirtualThreading::Ordinary => {
+                let cfg_attrs = self.cfg_attrs.iter();
+                let method_callback = make_virtual_callback(
+                    class_name,
+                    trait_base_class,
+                    &self.signature_info,
+                    self.before_kind,
+                    self.interface_trait.as_ref(),
+                    false,
+                );
+                quote! {
+                    #(#cfg_attrs)*
+                    #godot_name_hash_constant => #method_callback,
+                }
+            }
+            VirtualThreading::Always => {
+                let cfg_attrs = self.cfg_attrs.iter();
+                let method_callback = make_virtual_callback(
+                    class_name,
+                    trait_base_class,
+                    &self.signature_info,
+                    self.before_kind,
+                    self.interface_trait.as_ref(),
+                    true,
+                );
+                quote! {
+                    #(#cfg_attrs)*
+                    #godot_name_hash_constant => #method_callback,
+                }
+            }
+            VirtualThreading::Conditional(condition) => {
+                let threaded_cfg_attrs = self.cfg_attrs.iter();
+                let ordinary_cfg_attrs = self.cfg_attrs.iter();
+                let threaded_callback = make_virtual_callback(
+                    class_name,
+                    trait_base_class,
+                    &self.signature_info,
+                    self.before_kind,
+                    self.interface_trait.as_ref(),
+                    true,
+                );
+                let ordinary_callback = make_virtual_callback(
+                    class_name,
+                    trait_base_class,
+                    &self.signature_info,
+                    self.before_kind,
+                    self.interface_trait.as_ref(),
+                    false,
+                );
+                quote! {
+                    #(#threaded_cfg_attrs)*
+                    #[cfg(#condition)]
+                    #godot_name_hash_constant => #threaded_callback,
+                    #(#ordinary_cfg_attrs)*
+                    #[cfg(not(#condition))]
+                    #godot_name_hash_constant => #ordinary_callback,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+enum VirtualThreading {
+    #[default]
+    Ordinary,
+    Always,
+    Conditional(TokenStream),
+}
+
+impl VirtualThreading {
+    fn can_run_threaded(&self) -> bool {
+        !matches!(self, Self::Ordinary)
+    }
+
+    fn conditional_cfg(&self) -> Option<&TokenStream> {
+        match self {
+            Self::Conditional(condition) => Some(condition),
+            Self::Ordinary | Self::Always => None,
         }
     }
 }

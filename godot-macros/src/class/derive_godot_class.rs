@@ -87,6 +87,36 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         &prv,
     );
     let base_class = quote! { ::godot::classes::#base_ty };
+    let threading_const = if struct_cfg.is_unsafe_threaded {
+        quote! {
+            const __THREADING: ::godot::obj::ClassThreading =
+                ::godot::obj::ClassThreading::Blocking;
+            const __UNSAFE_THREADED_OPT_IN: bool = true;
+        }
+    } else {
+        TokenStream::new()
+    };
+    let threading_field_checks = if struct_cfg.is_unsafe_threaded {
+        let field_types = fields.all_fields.iter().map(|field| &field.ty);
+        quote! {
+            const _: () = {
+                assert!(
+                    ::godot::sys::UNSAFE_THREADED_CALLBACKS_SUPPORTED,
+                    "#[class(unsafe_threaded)] is incompatible with lazy-function-tables"
+                );
+
+                fn __godot_require_send<T: Send>() {}
+                fn __godot_require_threaded_contract<T: ::godot::obj::ThreadedGodotClass>() {}
+
+                fn __godot_check_unsafe_threaded_fields() {
+                    __godot_require_threaded_contract::<#class_name>();
+                    #( __godot_require_send::<#field_types>(); )*
+                }
+            };
+        }
+    } else {
+        TokenStream::new()
+    };
 
     // Use this name because when typing a non-existent class, users will be met with the following error:
     //    could not find `inherit_from_OS__ensure_class_exists` in `class_macros`.
@@ -176,6 +206,8 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         impl ::godot::obj::GodotClass for #class_name {
             type Base = #base_class;
 
+            #threading_const
+
             #singleton_init_level_const
 
             // Code duplicated in godot-codegen.
@@ -206,6 +238,7 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         #visibility_macro
         #base_field_macro
         #deny_manual_init_macro
+        #threading_field_checks
         #( #deprecations )*
         #( #errors )*
         #user_singleton_impl
@@ -386,6 +419,7 @@ struct ClassAttributes {
     is_tool: bool,
     is_singleton: bool,
     is_internal: bool,
+    is_unsafe_threaded: bool,
     rename: Option<Ident>,
     deprecations: Vec<TokenStream>,
 }
@@ -535,6 +569,7 @@ fn make_user_class_impl(
             &signature_info,
             BeforeKind::OnlyBefore,
             None,
+            false,
         );
 
         // See also __virtual_call() codegen.
@@ -601,6 +636,7 @@ fn parse_struct_attributes(class: &venial::Struct) -> ParseResult<ClassAttribute
     let mut is_tool = false;
     let mut is_singleton = false;
     let mut is_internal = false;
+    let mut is_unsafe_threaded = false;
     let mut rename: Option<Ident> = None;
     #[allow(unused_mut)] // Avoid churn when having 0 deprecations.
     let mut deprecations = vec![];
@@ -656,6 +692,15 @@ fn parse_struct_attributes(class: &venial::Struct) -> ParseResult<ClassAttribute
             }
         }
 
+        // #[class(unsafe_threaded)]
+        //
+        // This opts only this class into blocking instance storage and worker-callback binding access. The name intentionally makes the
+        // unsafety visible: it remains the implementor's responsibility to call only Godot APIs that are valid in the callback's thread
+        // context and not to access its Base<T> field there.
+        if parser.handle_alone("unsafe_threaded")? {
+            is_unsafe_threaded = true;
+        }
+
         // Removed #[class(hidden)]
         if let Some(key) = parser.handle_alone_with_span("hidden")? {
             return bail!(
@@ -694,6 +739,7 @@ fn parse_struct_attributes(class: &venial::Struct) -> ParseResult<ClassAttribute
         is_tool,
         is_singleton,
         is_internal,
+        is_unsafe_threaded,
         rename,
         deprecations,
     })

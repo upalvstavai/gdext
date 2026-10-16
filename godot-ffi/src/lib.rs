@@ -435,9 +435,14 @@ pub fn collect_startup_message(
 
 /// Print a single message to the editor UI via the FFI interface.
 fn print_message(msg: &StartupMessage) {
+    // Startup diagnostics can be flushed by an explicitly threaded callback (for example `free_instance` racing another live claim). Godot's
+    // print functions route through its synchronized logger and are already used through the reviewed thread-safe path by godot-core's print
+    // macros. The caller must still keep the binding alive for this call.
+    // SAFETY: `print_message` is only called while the extension binding is live; the selected print function is thread-safe.
+    let interface = unsafe { thread_safe() };
     let print_fn = match msg.level {
-        StartupMessageLevel::Warn => interface_fn!(print_warning),
-        StartupMessageLevel::Error | StartupMessageLevel::Fatal => interface_fn!(print_error),
+        StartupMessageLevel::Warn => interface.print_warning,
+        StartupMessageLevel::Error | StartupMessageLevel::Fatal => interface.print_error,
     };
 
     // SAFETY: The binding has been initialized, so we can use interface functions.

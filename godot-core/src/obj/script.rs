@@ -26,6 +26,7 @@ use crate::meta::RawPtr;
 use crate::meta::error::CallErrorType;
 use crate::obj::{Base, Gd, GodotClass};
 use crate::registry::info::{MethodInfo, PropertyInfo};
+use crate::storage::InaccessibleGuard;
 use crate::sys;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -569,6 +570,10 @@ impl<'a, T: ScriptInstance> SiMut<'a, T> {
     /// ```
     pub fn base_mut(&mut self) -> ScriptBaseMut<'_, T> {
         let guard = self.cell.make_inaccessible(self.mut_ref).unwrap();
+        #[cfg(feature = "experimental-threads")]
+        let guard = InaccessibleGuard::Blocking(guard);
+        #[cfg(not(feature = "experimental-threads"))]
+        let guard = InaccessibleGuard::Single(guard);
         let borrowed_gd = self.base_ref.to_script_borrowed();
 
         ScriptBaseMut::new(borrowed_gd, guard)

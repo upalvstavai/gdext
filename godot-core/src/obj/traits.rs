@@ -34,6 +34,21 @@ where
     /// The immediate superclass of `T`. This is always a Godot engine class.
     type Base: GodotClass; // not EngineClass because it can be ()
 
+    /// Selects the borrow/lifetime storage used for Rust instances of this class.
+    ///
+    /// This is an internal, experimental hook. User classes normally use the default. A class which Godot may invoke concurrently from
+    /// worker threads can opt into blocking storage through `#[class(unsafe_threaded)]`; doing so does not make arbitrary Godot APIs
+    /// thread-safe.
+    #[doc(hidden)]
+    const __THREADING: ClassThreading = ClassThreading::DEFAULT;
+
+    /// Whether this class explicitly accepted the worker-callback safety contract.
+    ///
+    /// Kept separate from [`Self::__THREADING`]: the global `experimental-threads` feature also
+    /// selects blocking storage, but must not silently satisfy an explicit per-class opt-in.
+    #[doc(hidden)]
+    const __UNSAFE_THREADED_OPT_IN: bool = false;
+
     /// Globally unique class ID, linked to the name under which the class is registered in Godot.
     ///
     /// The name may deviate from the Rust struct name: `HttpRequest::class_id().to_cow_str() == "HTTPRequest"`.
@@ -59,6 +74,77 @@ where
             Self::Base::inherits::<Base>()
         }
     }
+}
+
+/// Internal storage policy for user-defined Godot classes.
+///
+/// `Blocking` uses atomic lifetime bookkeeping and serializes access to the Rust instance across OS threads. While one thread holds any borrow,
+/// another thread waits even for a shared borrow. This is only one part of cross-thread safety: code in a worker callback still has to obey
+/// Godot's thread-safety restrictions.
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ClassThreading {
+    SingleThreaded,
+    Blocking,
+}
+
+/// Explicit safety contract for a [`GodotClass`] whose selected interface virtuals Godot may call from worker threads.
+///
+/// This trait is required together with `#[class(unsafe_threaded)]`. Each worker-capable regular virtual must additionally be selected either
+/// by putting `#[godot_api(unsafe_threaded)]` on its whole interface implementation or by putting `#[func(unsafe_threaded)]` on that method in
+/// an ordinary `#[godot_api]` interface implementation. The derive macro verifies that every field other than the recognized [`Base`] field
+/// is `Send`; the implementor must uphold the parts Rust cannot verify.
+///
+/// The opt-in is limited to the dynamic extent of the selected Godot-to-Rust virtual callbacks. The interface-level form selects every
+/// regular virtual in that implementation; the method-level form selects only the methods carrying `#[func(unsafe_threaded)]`. Unselected
+/// methods remain ordinary callbacks and may use [`Base`] under their normal main-thread contract. Constructors and registration,
+/// `to_string`, notifications, property hooks, and inherent `#[func]` methods cannot be selected. A selected virtual cannot use
+/// `#[func(gd_self)]` or otherwise take a `Gd<Self>` receiver. None of these opt-ins authorizes arbitrary Rust threads to use the class or the
+/// Godot API. The global `experimental-threads` feature does not replace any of the three explicit opt-ins, and `lazy-function-tables` is
+/// incompatible with `#[class(unsafe_threaded)]`.
+///
+/// Blocking storage grants one OS thread access to an instance at a time: while that thread holds any borrow, every borrow from another thread
+/// waits, including shared/shared access. Reentrant shared borrows on the same thread are allowed; a conflicting mutable re-entry fails. There
+/// is no timeout or deadlock detection.
+///
+/// # Safety
+///
+/// For every selected regular virtual, the implementation must:
+///
+/// - ensure that the complete callback ABI is valid in that thread context. This includes generated argument and return-value marshalling,
+///   custom `FromGodot`/`ToGodot`/`GodotConvert` code, and constructing, cloning, and dropping all values involved;
+/// - call only Godot APIs documented as valid in that callback's thread context. In particular, never call `base()`, `base_mut()`, or
+///   `to_gd()`, access the class's `Base<T>` field, obtain a `Gd<Self>`, or operate on any other Godot object unless that exact operation is
+///   documented as worker-safe. Blocking storage protects only the Rust instance, not the Godot object or scene tree;
+/// - keep any global or shared state synchronized;
+/// - avoid lock-order cycles. In particular, while a callback holds its receiver borrow, it must not wait for or call an operation that can
+///   synchronously dispatch another thread to the same instance. The same rule applies to external locks acquired around such calls;
+/// - never wait for extension teardown or for main-loop work that teardown can prevent from running. Deinitialization closes admission and
+///   waits for every already admitted callback, so such a dependency would form a shutdown deadlock. Calling teardown from an admitted
+///   callback is rejected;
+/// - avoid Godot calls that synchronously re-enter an ordinary lifecycle, property, exported `#[func]`, or non-threaded virtual callback,
+///   unless that complete reentrant path is also valid on the worker thread. The scoped FFI permission is thread-local and therefore remains
+///   active during synchronous re-entry;
+/// - finish all work which relies on the callback's binding permission before returning. Permission is thread-local, is not inherited by
+///   spawned threads, and does not cover deferred work or values whose safety depends on the callback after it returns;
+/// - ensure the engine stops dispatching new opted-in callbacks before extension deinitialization or library unload begins. Callbacks admitted
+///   before shutdown are drained, but a new callback beginning after admission closes violates this contract and is rejected fail-stop before
+///   its body runs;
+/// - make dropping `Self` and every non-`Base<T>` field safe on any thread which can release the final storage claim. If Godot frees the
+///   object during a worker, reference, or unreference callback, that callback may run `Drop`. Worker FFI permission is revoked before the
+///   final claim drops, so `Drop` and field destructors must not access the base object, operate on Godot objects, or call Godot APIs.
+///
+/// With interface-wide `#[godot_api(unsafe_threaded)]`, this contract applies to every regular virtual in that implementation, including
+/// virtuals which the current Godot version happens to invoke only on the main thread. With method-level `#[func(unsafe_threaded)]`, it applies
+/// only to the explicitly marked virtual callbacks.
+pub unsafe trait ThreadedGodotClass: GodotClass {}
+
+impl ClassThreading {
+    #[cfg(not(feature = "experimental-threads"))]
+    const DEFAULT: Self = Self::SingleThreaded;
+
+    #[cfg(feature = "experimental-threads")]
+    const DEFAULT: Self = Self::Blocking;
 }
 
 /// Type representing the absence of a base class, at the root of the hierarchy.

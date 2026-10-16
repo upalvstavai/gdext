@@ -5,16 +5,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
-#[cfg(feature = "experimental-threads")]
-use godot_cell::blocking::{GdCell, InaccessibleGuard, MutGuard, RefGuard};
-#[cfg(not(feature = "experimental-threads"))]
-use godot_cell::panicking::{GdCell, InaccessibleGuard, MutGuard, RefGuard};
+use godot_cell::blocking::GdCell;
 
 use crate::obj::{Base, GodotClass};
-use crate::storage::{AtomicLifecycle, DebugBorrowTracker, Lifecycle, Storage, StorageRefCounted};
-use crate::sys;
+use crate::storage::{
+    AtomicClaimState, AtomicLifecycle, CloseSnapshot, DebugBorrowTracker, InaccessibleGuard,
+    Lifecycle, MutGuard, RefGuard, Storage, StorageRefCounted,
+};
 
 pub struct InstanceStorage<T: GodotClass> {
     user_instance: GdCell<T>,
@@ -24,7 +21,7 @@ pub struct InstanceStorage<T: GodotClass> {
     pub(super) lifecycle: AtomicLifecycle,
 
     // Claims on this storage's lifetime: 1 from Godot, one from each ongoing Godot->Rust call. See `StorageClaim`.
-    claims: AtomicU32,
+    claims: AtomicClaimState,
 
     // No-op in Release mode.
     borrow_tracker: DebugBorrowTracker,
@@ -51,7 +48,7 @@ unsafe impl<T: GodotClass> Storage for InstanceStorage<T> {
             user_instance: GdCell::new(user_instance),
             base,
             lifecycle: AtomicLifecycle::new(Lifecycle::Alive),
-            claims: AtomicU32::new(1),
+            claims: AtomicClaimState::new(),
             borrow_tracker: DebugBorrowTracker::new(),
         }
     }
@@ -74,7 +71,7 @@ unsafe impl<T: GodotClass> Storage for InstanceStorage<T> {
             .unwrap_or_else(|e| super::bind_failed::<T>(e, &self.borrow_tracker));
 
         self.borrow_tracker.track_ref_borrow();
-        guard
+        RefGuard::Blocking(guard)
     }
 
     fn get_mut(&self) -> MutGuard<'_, T> {
@@ -84,7 +81,7 @@ unsafe impl<T: GodotClass> Storage for InstanceStorage<T> {
             .unwrap_or_else(|e| super::bind_mut_failed::<T>(e, &self.borrow_tracker));
 
         self.borrow_tracker.track_mut_borrow();
-        guard
+        MutGuard::Blocking(guard)
     }
 
     fn get_inaccessible<'a: 'b, 'b>(
@@ -93,6 +90,7 @@ unsafe impl<T: GodotClass> Storage for InstanceStorage<T> {
     ) -> InaccessibleGuard<'b, T> {
         self.user_instance
             .make_inaccessible(value)
+            .map(InaccessibleGuard::Blocking)
             .unwrap_or_else(|e| super::bug_inaccessible::<T>(e))
     }
 
@@ -106,20 +104,18 @@ unsafe impl<T: GodotClass> Storage for InstanceStorage<T> {
 }
 
 impl<T: GodotClass> InstanceStorage<T> {
-    /// Adds a claim; see [`StorageClaim`][crate::storage::StorageClaim].
-    pub(super) fn inc_claims(&self) {
-        // Relaxed suffices: like `Arc::clone()`, the caller already holds a claim, so the storage cannot be freed concurrently.
-        self.claims.fetch_add(1, Ordering::Relaxed);
+    /// Tries to add a claim; see [`StorageClaim`][crate::storage::StorageClaim].
+    pub(super) fn try_inc_claims(&self) -> bool {
+        self.claims.try_claim()
+    }
+
+    pub(super) fn begin_close_claims(&self) -> CloseSnapshot {
+        self.claims.begin_close()
     }
 
     /// Removes a claim; returns `true` if it was the last one.
     pub(super) fn dec_claims(&self) -> bool {
-        // AcqRel: the freeing thread must observe every storage access of the claims removed before it. Acquire on each decrement, not just
-        // the last one as `Arc` does -- one ordering instead of a release/fence split, on a counter that is nowhere near hot.
-        let prev = self.claims.fetch_sub(1, Ordering::AcqRel);
-        sys::strict_assert_ne!(prev, 0, "claim released more often than taken");
-
-        prev == 1
+        self.claims.release()
     }
 }
 

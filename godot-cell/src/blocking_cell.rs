@@ -42,18 +42,16 @@ impl<T> GdCellBlocking<T> {
     ///
     /// Fails if an accessible mutable reference exists on the current thread.
     ///
-    /// Blocks if another thread currently holds a mutable reference.
+    /// Blocks if another thread currently holds any reference.
     pub fn borrow(&self) -> Result<RefGuardBlocking<'_, T>, Box<dyn Error>> {
         let mut tracker_guard = self.thread_tracker.lock().unwrap();
 
-        if self.inner.as_ref().is_currently_mutably_bound()
-            && !tracker_guard.current_thread_has_mut_ref()
-        {
+        if self.current_thread_must_wait(&mut tracker_guard) {
             // Block current thread until borrow becomes available.
             tracker_guard = self.block_immut(tracker_guard);
         }
 
-        let should_claim_mut = !self.is_currently_bound();
+        let should_claim_mut = !self.is_currently_bound_locked();
 
         let inner_guard = self.inner.as_ref().borrow()?;
 
@@ -90,10 +88,7 @@ impl<T> GdCellBlocking<T> {
     pub fn borrow_mut(&self) -> Result<MutGuardBlocking<'_, T>, Box<dyn Error>> {
         let mut tracker_guard = self.thread_tracker.lock().unwrap();
 
-        if self.inner.as_ref().is_currently_bound()
-            && tracker_guard.current_thread_shared_count() == 0
-            && !tracker_guard.current_thread_has_mut_ref()
-        {
+        if self.current_thread_must_wait(&mut tracker_guard) {
             // Block current thread until borrow becomes available.
             tracker_guard = self.block_mut(tracker_guard);
         }
@@ -139,7 +134,20 @@ impl<T> GdCellBlocking<T> {
     /// cell hands out a new borrow before it is destroyed. So we still need to ensure that this cannot
     /// happen at the same time.
     pub fn is_currently_bound(&self) -> bool {
+        let _tracker_guard = self.thread_tracker.lock().unwrap();
+        self.is_currently_bound_locked()
+    }
+
+    /// Reads the inner borrow state while the caller holds `thread_tracker`.
+    fn is_currently_bound_locked(&self) -> bool {
         self.inner.as_ref().is_currently_bound()
+    }
+
+    /// Returns whether the current thread must wait for the thread that owns the active borrows.
+    fn current_thread_must_wait(&self, tracker: &mut ThreadTracker) -> bool {
+        self.is_currently_bound_locked()
+            && tracker.current_thread_shared_count() == 0
+            && !tracker.current_thread_has_mut_ref()
     }
 
     /// Blocks the current thread until all mutable and shared references have been dropped.
@@ -147,14 +155,14 @@ impl<T> GdCellBlocking<T> {
         &self,
         mut tracker_guard: MutexGuard<'a, ThreadTracker>,
     ) -> MutexGuard<'a, ThreadTracker> {
-        while self.inner.as_ref().is_currently_bound() {
+        while self.is_currently_bound_locked() {
             tracker_guard = self.mut_condition.wait(tracker_guard).unwrap();
         }
 
         tracker_guard
     }
 
-    /// Blocks the current thread until all mutable references have been dropped.
+    /// Blocks the current thread until all references have been dropped.
     fn block_immut<'a>(
         &self,
         mut tracker_guard: MutexGuard<'a, ThreadTracker>,
@@ -163,14 +171,19 @@ impl<T> GdCellBlocking<T> {
             tracker_guard = self.immut_condition.wait(tracker_guard).unwrap();
         }
 
+        while self.is_currently_bound_locked() {
+            tracker_guard = self.mut_condition.wait(tracker_guard).unwrap();
+        }
+
         tracker_guard
     }
 }
 
 // SAFETY:
-// - `T` must not be `Sync`, and the only way to access the underlying `T` is via `GdCellBlocking`.
-// - It must be ensured that `GdCellInner`, which holds `T`, cannot be accessed from multiple threads simultaneously while handing out guards.
-// The current implementation ensures this by locking the `thread_tracker`.
+// - The only way to access the underlying `T` is via `GdCellBlocking`.
+// - The `thread_tracker` lock serializes guard creation and allows guards to coexist only on the thread
+//   that owns the active borrows. Another thread waits until all those guards have been dropped.
+// Therefore `T` need only be `Send`: access can move between threads, but cannot happen concurrently.
 unsafe impl<T: Send> Sync for GdCellBlocking<T> {}
 
 /// Holds the reference count and the currently mutable thread.
@@ -227,18 +240,31 @@ impl ThreadTracker {
     /// Decrements the shared reference count in the current thread.
     pub fn decrement_current_thread_shared_count(&mut self) {
         let thread_id = current_thread_id();
-        let entry = self.find_shared_count(thread_id);
+        let entry = self
+            .shared_counts
+            .iter()
+            .position(|(id, _)| *id == thread_id);
 
         debug_assert!(
             entry.is_some(),
             "No shared reference count exists for {thread_id:?}."
         );
 
-        let Some(count) = entry else {
+        let Some(index) = entry else {
             return;
         };
 
-        *count -= 1;
+        let count = self.shared_counts[index].1;
+        debug_assert!(count > 0, "Shared reference count is already zero.");
+
+        if count > 1 {
+            self.shared_counts[index].1 = count - 1;
+        } else {
+            // Worker pools are usually bounded, but the cell must not retain every transient
+            // ThreadId which has ever borrowed it. A later borrow from this thread simply
+            // recreates the entry.
+            self.shared_counts.swap_remove(index);
+        }
     }
 
     /// Returns if the current thread can hold the mutable reference.
@@ -256,5 +282,234 @@ impl ThreadTracker {
     /// Claims the mutable reference for the current thread.
     fn claim_mut_ref(&mut self) {
         self.mut_thread = current_thread_id();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn shared_borrows_are_reentrant_on_the_same_thread() {
+        let cell = GdCellBlocking::new(Cell::new(1));
+
+        let first = cell.borrow().unwrap();
+        let second = cell.borrow().unwrap();
+
+        first.set(2);
+        assert_eq!(second.get(), 2);
+    }
+
+    #[test]
+    fn shared_borrow_from_another_thread_must_wait() {
+        let cell = GdCellBlocking::new(Cell::new(1));
+        let _guard = cell.borrow().unwrap();
+
+        thread::scope(|scope| {
+            let must_wait = scope
+                .spawn(|| {
+                    let mut tracker = cell.thread_tracker.lock().unwrap();
+                    cell.current_thread_must_wait(&mut tracker)
+                })
+                .join()
+                .unwrap();
+
+            assert!(must_wait);
+        });
+    }
+
+    #[test]
+    fn shared_borrow_transfers_to_another_thread_after_release() {
+        let cell = GdCellBlocking::new(Cell::new(1));
+        let guard = cell.borrow().unwrap();
+
+        thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (value_tx, value_rx) = mpsc::channel();
+            let cell = &cell;
+
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let guard = cell.borrow().unwrap();
+                value_tx.send(guard.get()).unwrap();
+            });
+
+            started_rx.recv().unwrap();
+            drop(guard);
+
+            assert_eq!(value_rx.recv().unwrap(), 1);
+            worker.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn completed_threads_do_not_accumulate_shared_count_entries() {
+        let cell = GdCellBlocking::new(Cell::new(1));
+
+        thread::scope(|scope| {
+            for _ in 0..64 {
+                scope
+                    .spawn(|| {
+                        let guard = cell.borrow().unwrap();
+                        assert_eq!(guard.get(), 1);
+                    })
+                    .join()
+                    .unwrap();
+            }
+        });
+
+        assert!(cell.thread_tracker.lock().unwrap().shared_counts.is_empty());
+    }
+
+    #[test]
+    fn cross_thread_shared_borrow_really_blocks_until_release() {
+        let cell = GdCellBlocking::new(Cell::new(1));
+        let guard = cell.borrow().unwrap();
+
+        thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let cell = &cell;
+
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let worker_guard = cell.borrow().unwrap();
+                acquired_tx.send(worker_guard.get()).unwrap();
+            });
+
+            started_rx.recv().unwrap();
+            assert!(matches!(
+                acquired_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+
+            drop(guard);
+            assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+            worker.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn cross_thread_mutable_borrow_waits_for_shared_release() {
+        let cell = GdCellBlocking::new(Cell::new(1));
+        let guard = cell.borrow().unwrap();
+
+        thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let cell = &cell;
+
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let worker_guard = cell.borrow_mut().unwrap();
+                acquired_tx.send(worker_guard.get()).unwrap();
+            });
+
+            started_rx.recv().unwrap();
+            assert!(matches!(
+                acquired_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+
+            drop(guard);
+            assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+            worker.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn cross_thread_shared_borrow_waits_for_mutable_release() {
+        let cell = GdCellBlocking::new(Cell::new(1));
+        let guard = cell.borrow_mut().unwrap();
+
+        thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let cell = &cell;
+
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let worker_guard = cell.borrow().unwrap();
+                acquired_tx.send(worker_guard.get()).unwrap();
+            });
+
+            started_rx.recv().unwrap();
+            assert!(matches!(
+                acquired_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+
+            drop(guard);
+            assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+            worker.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn panicking_borrower_does_not_strand_waiters() {
+        let cell = GdCellBlocking::new(Cell::new(1));
+
+        thread::scope(|scope| {
+            let cell = &cell;
+            let panicking_worker = scope.spawn(move || {
+                let _guard = cell.borrow().unwrap();
+                panic!("intentional panic while borrowed");
+            });
+            assert!(panicking_worker.join().is_err());
+
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let next_worker = scope.spawn(move || {
+                let guard = cell.borrow().unwrap();
+                acquired_tx.send(guard.get()).unwrap();
+            });
+
+            assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+            next_worker.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn non_sync_value_is_never_observed_by_two_threads_at_once() {
+        struct Probe {
+            active: AtomicUsize,
+            visits: Cell<usize>,
+        }
+
+        impl Probe {
+            fn visit(&self) {
+                assert_eq!(self.active.fetch_add(1, Ordering::SeqCst), 0);
+                thread::yield_now();
+                self.visits.set(self.visits.get() + 1);
+                assert_eq!(self.active.fetch_sub(1, Ordering::SeqCst), 1);
+            }
+        }
+
+        let cell = GdCellBlocking::new(Probe {
+            active: AtomicUsize::new(0),
+            visits: Cell::new(0),
+        });
+
+        thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        for _ in 0..250 {
+                            cell.borrow().unwrap().visit();
+                        }
+                    })
+                })
+                .collect();
+
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+
+        assert_eq!(cell.borrow().unwrap().visits.get(), 2_000);
     }
 }

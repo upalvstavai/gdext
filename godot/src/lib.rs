@@ -145,12 +145,17 @@
 //!   Instead of loading all engine function pointers at startup, load them lazily on first use. This reduces startup time and RAM usage, but
 //!   incurs additional overhead in each FFI call. Also, you lose the guarantee that once the library has booted, all function pointers are
 //!   truly available. Function calls may thus panic only at runtime, possibly in deeply nested code paths.
-//!   This feature is not yet thread-safe and can thus not be combined with `experimental-threads`.<br><br>
+//!   This feature is not yet thread-safe and can thus not be combined with `experimental-threads`. A class using
+//!   `#[class(unsafe_threaded)]` is also rejected at compile time while `lazy-function-tables` is enabled.<br><br>
 //!
 //! * **`experimental-threads`**
 //!
-//!   Experimental threading support. This adds synchronization to access the user instance in `Gd<T>` and disables several single-thread checks.
-//!   The safety aspects are not ironed out yet; there is a high risk of unsoundness at the moment.
+//!   Legacy, process-wide experimental threading support. This selects synchronized instance storage for every user class and disables several
+//!   main-thread binding checks, but it does not verify that ordinary user classes are `Send` or prove that an engine callback is valid on a
+//!   worker. A non-`Send` class which Godot actually invokes or destroys there can therefore still be unsound. The narrower callback path uses
+//!   explicit `#[class(unsafe_threaded)]`, `unsafe impl godot::obj::ThreadedGodotClass`, and either interface-wide
+//!   `#[godot_api(unsafe_threaded)]` or method-level `#[func(unsafe_threaded)]` selection; the global feature does not replace that contract.
+//!   The remaining safety aspects of the global mode are not ironed out yet; there is a high risk of unsoundness at the moment.
 //!   As this evolves, it is very likely that the API becomes stricter.<br><br>
 //!
 //! * **`experimental-wasm`**

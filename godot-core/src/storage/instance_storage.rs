@@ -8,16 +8,64 @@
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-#[cfg(feature = "experimental-threads")]
-use godot_cell::blocking::{InaccessibleGuard, MutGuard, RefGuard};
-#[cfg(not(feature = "experimental-threads"))]
-use godot_cell::panicking::{InaccessibleGuard, MutGuard, RefGuard};
+use godot_cell::{blocking, panicking};
 use godot_ffi as sys;
 
 use crate::godot_error;
-use crate::obj::{Base, Gd, GodotClass, Inherits, Singleton};
+use crate::obj::{Base, ClassThreading, Gd, GodotClass, Inherits, Singleton};
+use crate::storage::instance_registry::{self, InstanceHandle};
 use crate::storage::log_pre_drop;
+
+#[derive(Debug)]
+pub enum RefGuard<'a, T> {
+    Single(panicking::RefGuard<'a, T>),
+    Blocking(blocking::RefGuard<'a, T>),
+}
+
+impl<T> Deref for RefGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Single(guard) => guard,
+            Self::Blocking(guard) => guard,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum MutGuard<'a, T> {
+    Single(panicking::MutGuard<'a, T>),
+    Blocking(blocking::MutGuard<'a, T>),
+}
+
+impl<T> Deref for MutGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Single(guard) => guard,
+            Self::Blocking(guard) => guard,
+        }
+    }
+}
+
+impl<T> DerefMut for MutGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Single(guard) => guard,
+            Self::Blocking(guard) => guard,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum InaccessibleGuard<'a, T> {
+    Single(panicking::InaccessibleGuard<'a, T>),
+    Blocking(blocking::InaccessibleGuard<'a, T>),
+}
 
 sys::atomic_enum! {
     #[derive(Copy, Clone, Debug)]
@@ -30,6 +78,149 @@ sys::atomic_enum! {
 /// Type-safe atomic wrapper for [`Lifecycle`].
 #[cfg_attr(not(feature = "experimental-threads"), allow(dead_code))]
 pub type AtomicLifecycle = sys::AtomicEnum<Lifecycle>;
+
+const CLAIMS_CLOSED_BIT: u32 = 1 << 31;
+const CLAIMS_COUNT_MASK: u32 = CLAIMS_CLOSED_BIT - 1;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct CloseSnapshot {
+    claim_count: u32,
+}
+
+impl CloseSnapshot {
+    pub(super) fn has_call_claims(self) -> bool {
+        // One distinguished claim belongs to Godot from construction until the free callback.
+        self.claim_count > 1
+    }
+}
+
+/// Claim admission for single-threaded storage. It mirrors [`AtomicClaimState`] so destruction uses one protocol for both storage kinds.
+pub(super) struct LocalClaimState {
+    state: Cell<u32>,
+}
+
+impl LocalClaimState {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Cell::new(1),
+        }
+    }
+
+    pub(super) fn try_claim(&self) -> bool {
+        let state = self.state.get();
+        let count = state & CLAIMS_COUNT_MASK;
+
+        if state & CLAIMS_CLOSED_BIT != 0 || count == 0 || count == CLAIMS_COUNT_MASK {
+            return false;
+        }
+
+        self.state.set(state + 1);
+        true
+    }
+
+    pub(super) fn begin_close(&self) -> CloseSnapshot {
+        let state = self.state.get();
+        let count = state & CLAIMS_COUNT_MASK;
+
+        assert_eq!(
+            state & CLAIMS_CLOSED_BIT,
+            0,
+            "storage closed more than once"
+        );
+        assert_ne!(count, 0, "storage closed without an owning claim");
+
+        self.state.set(state | CLAIMS_CLOSED_BIT);
+        CloseSnapshot { claim_count: count }
+    }
+
+    pub(super) fn release(&self) -> bool {
+        let state = self.state.get();
+        let count = state & CLAIMS_COUNT_MASK;
+
+        assert_ne!(count, 0, "claim released more often than taken");
+        assert!(
+            count != 1 || state & CLAIMS_CLOSED_BIT != 0,
+            "last claim released before storage was closed"
+        );
+
+        self.state.set(state - 1);
+        count == 1
+    }
+}
+
+/// Packed close flag and lifetime-claim count for blocking storage.
+///
+/// `begin_close()` atomically forbids new claims while retaining Godot's distinguished claim. A successful `try_claim()` therefore either
+/// linearizes before close and is counted until it releases, or observes close and fails; the counter can never be resurrected from zero.
+pub(super) struct AtomicClaimState {
+    state: AtomicU32,
+}
+
+impl AtomicClaimState {
+    pub(super) fn new() -> Self {
+        Self {
+            state: AtomicU32::new(1),
+        }
+    }
+
+    pub(super) fn try_claim(&self) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+
+        loop {
+            let count = state & CLAIMS_COUNT_MASK;
+            if state & CLAIMS_CLOSED_BIT != 0 || count == 0 || count == CLAIMS_COUNT_MASK {
+                return false;
+            }
+
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    pub(super) fn begin_close(&self) -> CloseSnapshot {
+        let state = self.state.fetch_or(CLAIMS_CLOSED_BIT, Ordering::AcqRel);
+        let count = state & CLAIMS_COUNT_MASK;
+
+        assert_eq!(
+            state & CLAIMS_CLOSED_BIT,
+            0,
+            "storage closed more than once"
+        );
+        assert_ne!(count, 0, "storage closed without an owning claim");
+
+        CloseSnapshot { claim_count: count }
+    }
+
+    pub(super) fn release(&self) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+
+        loop {
+            let count = state & CLAIMS_COUNT_MASK;
+            assert_ne!(count, 0, "claim released more often than taken");
+            assert!(
+                count != 1 || state & CLAIMS_CLOSED_BIT != 0,
+                "last claim released before storage was closed"
+            );
+
+            match self.state.compare_exchange_weak(
+                state,
+                state - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return count == 1,
+                Err(actual) => state = actual,
+            }
+        }
+    }
+}
 
 /// A storage for an instance binding.
 ///
@@ -132,11 +323,136 @@ pub(crate) trait StorageRefCounted: Storage {
     fn on_dec_ref(&self);
 }
 
-#[cfg(not(feature = "experimental-threads"))]
-pub type InstanceStorage<T> = crate::storage::single_threaded::InstanceStorage<T>;
+pub enum InstanceStorage<T: GodotClass> {
+    Single(crate::storage::single_threaded::InstanceStorage<T>),
+    Blocking(crate::storage::multi_threaded::InstanceStorage<T>),
+}
 
-#[cfg(feature = "experimental-threads")]
-pub type InstanceStorage<T> = crate::storage::multi_threaded::InstanceStorage<T>;
+unsafe impl<T: GodotClass> Storage for InstanceStorage<T> {
+    type Instance = T;
+
+    fn construct(user_instance: T, base: Base<T::Base>) -> Self {
+        match T::__THREADING {
+            ClassThreading::SingleThreaded => Self::Single(
+                crate::storage::single_threaded::InstanceStorage::construct(user_instance, base),
+            ),
+            ClassThreading::Blocking => Self::Blocking(
+                crate::storage::multi_threaded::InstanceStorage::construct(user_instance, base),
+            ),
+        }
+    }
+
+    fn is_bound(&self) -> bool {
+        match self {
+            Self::Single(storage) => storage.is_bound(),
+            Self::Blocking(storage) => storage.is_bound(),
+        }
+    }
+
+    fn base(&self) -> &Base<T::Base> {
+        match self {
+            Self::Single(storage) => storage.base(),
+            Self::Blocking(storage) => storage.base(),
+        }
+    }
+
+    fn get(&self) -> RefGuard<'_, T> {
+        match self {
+            Self::Single(storage) => storage.get(),
+            Self::Blocking(storage) => storage.get(),
+        }
+    }
+
+    fn get_mut(&self) -> MutGuard<'_, T> {
+        match self {
+            Self::Single(storage) => storage.get_mut(),
+            Self::Blocking(storage) => storage.get_mut(),
+        }
+    }
+
+    fn get_inaccessible<'a: 'b, 'b>(&'a self, instance: &'b mut T) -> InaccessibleGuard<'b, T> {
+        match self {
+            Self::Single(storage) => storage.get_inaccessible(instance),
+            Self::Blocking(storage) => storage.get_inaccessible(instance),
+        }
+    }
+
+    fn get_lifecycle(&self) -> Lifecycle {
+        match self {
+            Self::Single(storage) => storage.get_lifecycle(),
+            Self::Blocking(storage) => storage.get_lifecycle(),
+        }
+    }
+
+    fn set_lifecycle(&self, lifecycle: Lifecycle) {
+        match self {
+            Self::Single(storage) => storage.set_lifecycle(lifecycle),
+            Self::Blocking(storage) => storage.set_lifecycle(lifecycle),
+        }
+    }
+}
+
+impl<T: GodotClass> InstanceStorage<T> {
+    /// Puts this storage on the heap and returns the opaque instance token Godot must retain.
+    ///
+    /// Single-threaded classes preserve the direct-pointer representation. Blocking classes use a never-reused registry handle, so a
+    /// callback racing destruction can first acquire its lifetime claim without dereferencing an address that may already have been freed.
+    pub(crate) fn into_instance_ptr(self) -> sys::GDExtensionClassInstancePtr {
+        let mut storage = Box::new(self);
+        let storage_ptr: *mut Self = &mut *storage;
+
+        match T::__THREADING {
+            ClassThreading::SingleThreaded => Box::into_raw(storage).cast(),
+            ClassThreading::Blocking => {
+                let handle = instance_registry::register(storage_ptr).unwrap_or_else(|error| {
+                    panic!("failed to register blocking instance storage: {error}")
+                });
+
+                // Registration now owns the responsibility for making this allocation discoverable until its last claim. No callback can
+                // observe the handle before this method returns it to the engine, and every destruction path removes the entry first.
+                std::mem::forget(storage);
+                handle.into_instance_ptr()
+            }
+        }
+    }
+
+    pub(super) fn try_inc_claims(&self) -> bool {
+        match self {
+            Self::Single(storage) => storage.try_inc_claims(),
+            Self::Blocking(storage) => storage.try_inc_claims(),
+        }
+    }
+
+    pub(super) fn begin_close_claims(&self) -> CloseSnapshot {
+        match self {
+            Self::Single(storage) => storage.begin_close_claims(),
+            Self::Blocking(storage) => storage.begin_close_claims(),
+        }
+    }
+
+    pub(super) fn dec_claims(&self) -> bool {
+        match self {
+            Self::Single(storage) => storage.dec_claims(),
+            Self::Blocking(storage) => storage.dec_claims(),
+        }
+    }
+}
+
+impl<T: GodotClass> StorageRefCounted for InstanceStorage<T> {
+    fn on_inc_ref(&self) {
+        match self {
+            Self::Single(storage) => storage.on_inc_ref(),
+            Self::Blocking(storage) => storage.on_inc_ref(),
+        }
+    }
+
+    fn on_dec_ref(&self) {
+        match self {
+            Self::Single(storage) => storage.on_dec_ref(),
+            Self::Blocking(storage) => storage.on_dec_ref(),
+        }
+    }
+}
 
 const fn _assert_implements_storage<T: Storage + StorageRefCounted>() {}
 
@@ -235,8 +551,7 @@ where
 /// then dies while a `GdRef`/`GdMut` guard is still active.
 ///
 /// The storage counts claims: Godot holds one from construction to destruction, each ongoing call holds one. Removing the last claim frees the
-/// storage. Guards borrow the claim, so they drop first. A counter rather than a flag, to handle nested calls; atomic under
-/// `experimental-threads`.
+/// storage. Guards borrow the claim, so they drop first. A counter rather than a flag, to handle nested calls; atomic for blocking storage.
 ///
 /// Only the storage survives, not the Godot object -- godot-rust cannot prevent its destruction: `Ref::unref()` decides to `memdelete` before
 /// the extension's `unreference` callback runs, and `free()` is immediate. Holding a strong reference for the call's duration, like GDScript
@@ -244,12 +559,35 @@ where
 /// call, field access works but base operations panic and `Drop` sees a dead base. To survive the call, an object needs a reference that
 /// outlives it: `self.to_gd().run_deferred_gd(|_| {})`.
 ///
-/// Entry points which run no user code (`free`, `reference`, `unreference`) use [`as_weak_storage()`] instead.
+/// Every callback which can overlap destruction, including `reference` and `unreference`, takes a claim. The `free` callback closes admission
+/// while its distinguished Godot claim still pins the allocation.
 #[must_use = "dropping the claim immediately releases it, which may free the storage"]
 pub struct StorageClaim<T: GodotClass> {
     // Raw pointer rather than reference: the claim owns no borrow (other claims may exist), and freeing needs write access to the whole
     // allocation for drop(&mut). Using a &InstanceStorage shared-ref would be unsound as it would eventually be promoted to &mut.
     storage: *mut InstanceStorage<T>,
+    // Present only for blocking storage. It identifies the registry entry which must be removed before the allocation can be freed.
+    handle: Option<InstanceHandle>,
+}
+
+impl<T: GodotClass> std::fmt::Debug for StorageClaim<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageClaim")
+            .field("storage", &self.storage)
+            .field("handle", &self.handle)
+            .finish()
+    }
+}
+
+impl<T: GodotClass> StorageClaim<T> {
+    /// Returns the claimed storage with a caller-chosen lifetime.
+    ///
+    /// # Safety
+    /// The returned reference and every value borrowing it must be dropped before this claim. The allocation itself is pinned.
+    pub(crate) unsafe fn storage_unbounded<'a>(&self) -> &'a InstanceStorage<T> {
+        // SAFETY: a live claim prevents deallocation, and the caller is responsible for keeping this claim alive for `'a`.
+        unsafe { &*self.storage }
+    }
 }
 
 impl<T: GodotClass> Deref for StorageClaim<T> {
@@ -265,7 +603,7 @@ impl<T: GodotClass> Drop for StorageClaim<T> {
     fn drop(&mut self) {
         if self.dec_claims() {
             // SAFETY: this was the last claim, and the guards borrowing it are already dropped.
-            unsafe { deallocate_storage(self.storage) };
+            unsafe { deallocate_storage(self.storage, self.handle) };
         }
     }
 }
@@ -274,26 +612,40 @@ impl<T: GodotClass> Drop for StorageClaim<T> {
 ///
 /// # Safety
 /// The last claim on `storage` must have been released, and no reference into it may be live.
-unsafe fn deallocate_storage<T: GodotClass>(storage: *mut InstanceStorage<T>) {
+unsafe fn deallocate_storage<T: GodotClass>(
+    storage: *mut InstanceStorage<T>,
+    handle: Option<InstanceHandle>,
+) {
+    if let Some(handle) = handle {
+        // Removal must precede every later read and `Box::from_raw`: once the last claim is gone, no new lookup may recover this allocation.
+        // If the defensive `is_bound()` check below detects broken bookkeeping, we intentionally leak the allocation so the stray Rust
+        // reference remains valid, but the handle still stays retired; retaining the registry entry would expose a destroyed zombie to new
+        // weak lookups.
+        assert!(
+            instance_registry::remove(handle, storage),
+            "blocking instance storage registry entry missing or mismatched during deallocation"
+        );
+    }
+
     // SAFETY: delegated to caller.
     let storage_ref = unsafe { &*storage };
 
-    // A guard still points into the storage -> leak instead of freeing, so its references stay valid.
-    // Only reachable for guards that hold no "claim", i.e. `Gd::bind()` outside a Godot->Rust call.
-    // Guards within such calls borrow the claim and thus drop before it.
+    // Every GdRef/GdMut owns a claim, and callback guards borrow a callback claim. At count zero admission is closed, so no new guard can
+    // start. A bound value here therefore indicates an internal lifetime-invariant violation; retain the allocation rather than invalidating
+    // the reference.
     if storage_ref.is_bound() {
         report_destruction_while_bound(storage_ref); // May crash process, depending on safeguard level.
         return;
     }
 
-    // SAFETY: no claim is left, so no call is ongoing and no other reference into the storage exists -- guards borrow the claim, and
-    // `is_bound()` ruled out stray ones. Dropping is thus allowed by the safety contract of `Storage`, which `InstanceStorage<T>`
-    // implements (see `_INSTANCE_STORAGE_IMPLEMENTS_STORAGE`). The allocation stems from `Storage::into_raw()`.
+    // SAFETY: no claim is left and admission is closed, so no callback, bind guard, or in-progress blocking borrow can exist or start.
+    // `is_bound()` ruled out an internal bookkeeping violation. Dropping is therefore allowed by `Storage`'s safety contract. The allocation
+    // stems from `InstanceStorage::into_instance_ptr()`.
     let _drop = unsafe { Box::from_raw(storage) };
 }
 
-/// Interprets the opaque pointer as pointing to `InstanceStorage<T>`. Sole place deriving storage pointers from Godot's instance pointer.
-fn as_storage_ptr<T: GodotClass>(
+/// Interprets a single-threaded class's opaque pointer as pointing directly to `InstanceStorage<T>`.
+fn direct_storage_ptr<T: GodotClass>(
     instance_ptr: sys::GDExtensionClassInstancePtr,
 ) -> *mut InstanceStorage<T> {
     instance_ptr as *mut InstanceStorage<T>
@@ -308,23 +660,83 @@ fn as_storage_ptr<T: GodotClass>(
 pub unsafe fn as_storage<T: GodotClass>(
     instance_ptr: sys::GDExtensionClassInstancePtr,
 ) -> StorageClaim<T> {
-    let storage = as_storage_ptr::<T>(instance_ptr);
-
     // SAFETY: delegated to caller.
-    unsafe { (*storage).inc_claims() };
-
-    StorageClaim { storage }
+    unsafe { try_as_storage(instance_ptr) }.unwrap_or_else(|| {
+        panic!(
+            "Godot callback tried to access {} after instance destruction began",
+            std::any::type_name::<T>()
+        )
+    })
 }
 
-/// Like [`as_storage()`], but *weak*: the returned reference does not keep the storage alive. Only for entry points that run no user code.
+/// Tries to claim a live instance storage. Returns `None` once its free callback has begun closing claim admission.
+///
+/// # Safety
+/// For single-threaded storage, `instance_ptr` must point to the still-allocated claim header. For blocking storage it must be an opaque handle
+/// previously issued for `T`; stale handles are safely rejected. A successful claim keeps the whole storage alive until the returned value
+/// drops.
+pub unsafe fn try_as_storage<T: GodotClass>(
+    instance_ptr: sys::GDExtensionClassInstancePtr,
+) -> Option<StorageClaim<T>> {
+    match T::__THREADING {
+        ClassThreading::SingleThreaded => {
+            let storage = direct_storage_ptr::<T>(instance_ptr);
+
+            // SAFETY: delegated to caller. Single-threaded callbacks cannot race deallocation, and the local claim state still rejects
+            // logically late access after close.
+            if !unsafe { (*storage).try_inc_claims() } {
+                return None;
+            }
+
+            Some(StorageClaim {
+                storage,
+                handle: None,
+            })
+        }
+        ClassThreading::Blocking => {
+            let handle = InstanceHandle::from_instance_ptr(instance_ptr)?;
+            let storage =
+                instance_registry::with_read::<InstanceStorage<T>, _>(handle, |storage| {
+                    // SAFETY: the registry read lock prevents close/removal while claim admission examines this allocation.
+                    unsafe { (*storage).try_inc_claims() }.then_some(storage)
+                })??;
+
+            Some(StorageClaim {
+                storage,
+                handle: Some(handle),
+            })
+        }
+    }
+}
+
+/// Like [`as_storage()`], but *weak*: the returned reference does not keep the storage alive.
+///
+/// This is only for code whose caller independently proves that destruction cannot overlap (for example a live, thread-confined `Gd`). FFI
+/// callbacks which may race the free callback must use [`try_as_storage()`] instead.
 ///
 /// # Safety
 /// Same as [`as_storage()`]. Additionally, the storage must not be destroyed while the returned reference is live.
 pub unsafe fn as_weak_storage<'u, T: GodotClass>(
     instance_ptr: sys::GDExtensionClassInstancePtr,
 ) -> &'u InstanceStorage<T> {
-    // SAFETY: delegated to caller.
-    unsafe { &*as_storage_ptr::<T>(instance_ptr) }
+    let storage = match T::__THREADING {
+        ClassThreading::SingleThreaded => direct_storage_ptr::<T>(instance_ptr),
+        ClassThreading::Blocking => {
+            let handle = InstanceHandle::from_instance_ptr(instance_ptr)
+                .expect("null blocking instance storage handle");
+            instance_registry::with_read::<InstanceStorage<T>, _>(handle, |storage| storage)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Godot callback tried to weakly access {} after its storage was unregistered",
+                        std::any::type_name::<T>()
+                    )
+                })
+        }
+    };
+
+    // SAFETY: delegated to caller. For blocking storage the registry lookup preserves pointer provenance; the caller's independent lifetime
+    // proof (normally a live Godot or callback claim) keeps the entry and allocation alive after the read lock is released.
+    unsafe { &*storage }
 }
 
 /// Releases the claim Godot took when the storage was constructed; see [`StorageClaim`].
@@ -332,23 +744,177 @@ pub unsafe fn as_weak_storage<'u, T: GodotClass>(
 /// Deallocates the storage, unless a Godot -> Rust call still holds a claim -- then the last of those calls deallocates it.
 ///
 /// # Safety
-/// `instance_ptr` is assumed to point to a valid instance. This function must only be invoked once for a pointer.
+/// `instance_ptr` is assumed to identify a valid instance. This function must only be invoked once for a pointer or handle.
 pub unsafe fn release_godot_claim<T: GodotClass>(instance_ptr: sys::GDExtensionClassInstancePtr) {
-    let storage = as_storage_ptr::<T>(instance_ptr);
+    let (storage, handle, close_snapshot) = match T::__THREADING {
+        ClassThreading::SingleThreaded => {
+            let storage = direct_storage_ptr::<T>(instance_ptr);
+            // SAFETY: Godot's distinguished claim pins direct single-threaded storage for this callback.
+            let snapshot = unsafe { (*storage).begin_close_claims() };
+            (storage, None, snapshot)
+        }
+        ClassThreading::Blocking => {
+            let handle = InstanceHandle::from_instance_ptr(instance_ptr)
+                .expect("null blocking instance storage handle in free callback");
+            let (storage, snapshot) = instance_registry::with_write::<InstanceStorage<T>, _>(
+                handle,
+                |storage| {
+                    // SAFETY: the registry write lock excludes every pre-claim lookup. Godot's distinguished claim keeps the allocation live.
+                    let snapshot = unsafe { (*storage).begin_close_claims() };
+                    (storage, snapshot)
+                },
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "blocking instance storage for {} was missing or mismatched in free callback",
+                    std::any::type_name::<T>()
+                )
+            });
+            (storage, Some(handle), snapshot)
+        }
+    };
 
-    // SAFETY: Godot's claim exists since construction, and the caller guarantees to release it only once.
-    let was_last_claim = unsafe { (*storage).dec_claims() };
+    release_godot_claim_ordered(
+        // Close was already linearized under the registry write lock for blocking storage, or directly on this thread for single storage.
+        || close_snapshot,
+        |snapshot| {
+            // SAFETY: this callback runs before releasing Godot's claim.
+            let storage_ref = unsafe { &*storage };
+            storage_ref.mark_destroyed_by_godot();
 
-    if was_last_claim {
-        // SAFETY: no claim is left; each entry point running user code holds one for its duration.
-        unsafe { deallocate_storage(storage) };
-        return;
+            if snapshot.has_call_claims() {
+                // Object died while a call still holds a claim, no matter if the last reference was dropped or `free()` was called. Both
+                // leave the engine with a dangling `this` for the rest of the call.
+                report_destruction_during_call(storage_ref);
+            }
+        },
+        // SAFETY: Godot's claim exists since construction, and the caller guarantees to release it only once.
+        || unsafe { (*storage).dec_claims() },
+        // SAFETY: invoked only when releasing Godot's claim left no claim alive.
+        || unsafe { deallocate_storage(storage, handle) },
+    );
+}
+
+/// Reports while the caller-owned Godot claim still pins the allocation, then releases that claim.
+///
+/// Keeping this ordering in one testable function prevents a last concurrent call claim from freeing storage between claim release and the
+/// diagnostic's storage access.
+fn release_godot_claim_ordered(
+    begin_close: impl FnOnce() -> CloseSnapshot,
+    while_pinned: impl FnOnce(CloseSnapshot),
+    release_claim: impl FnOnce() -> bool,
+    deallocate: impl FnOnce(),
+) {
+    let snapshot = begin_close();
+    while_pinned(snapshot);
+
+    if release_claim() {
+        deallocate();
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+
+    use super::{
+        AtomicClaimState, CLAIMS_COUNT_MASK, InstanceStorage, LocalClaimState, direct_storage_ptr,
+        release_godot_claim_ordered,
+    };
+    use crate::classes::Object;
+
+    #[test]
+    fn godot_claim_pins_storage_through_concurrent_destruction_report() {
+        let claims = AtomicClaimState::new();
+        assert!(claims.try_claim(), "simulate an admitted callback claim");
+
+        let alive = AtomicBool::new(true);
+        let deallocations = AtomicU32::new(0);
+        let (report_started_tx, report_started_rx) = mpsc::sync_channel(0);
+        let (callback_released_tx, callback_released_rx) = mpsc::sync_channel(0);
+
+        thread::scope(|scope| {
+            let claims_ref = &claims;
+            let alive_ref = &alive;
+            let deallocations_ref = &deallocations;
+            let callback = scope.spawn(move || {
+                report_started_rx.recv().unwrap();
+
+                if claims_ref.release() {
+                    alive_ref.store(false, Ordering::SeqCst);
+                    deallocations_ref.fetch_add(1, Ordering::SeqCst);
+                }
+
+                callback_released_tx.send(()).unwrap();
+            });
+
+            release_godot_claim_ordered(
+                || claims.begin_close(),
+                |snapshot| {
+                    assert!(snapshot.has_call_claims());
+                    report_started_tx.send(()).unwrap();
+                    callback_released_rx.recv().unwrap();
+
+                    // The callback claim is gone, but the diagnostic can still read storage because Godot's claim has not been released.
+                    assert!(alive.load(Ordering::SeqCst));
+                },
+                || claims.release(),
+                || {
+                    assert!(alive.swap(false, Ordering::SeqCst));
+                    deallocations.fetch_add(1, Ordering::SeqCst);
+                },
+            );
+
+            callback.join().unwrap();
+        });
+
+        assert!(!alive.load(Ordering::SeqCst));
+        assert_eq!(deallocations.load(Ordering::SeqCst), 1);
     }
 
-    // Object died while a call still holds a claim, no matter if the last reference was dropped or `free()` was called. Both leave the engine
-    // with a dangling `this` for the rest of the call.
-    // SAFETY: the remaining claim keeps the storage alive.
-    unsafe { report_destruction_during_call(&*storage) };
+    #[test]
+    fn close_rejects_late_claim_and_zero_cannot_be_resurrected() {
+        let claims = AtomicClaimState::new();
+
+        let snapshot = claims.begin_close();
+        assert!(!snapshot.has_call_claims());
+        assert!(!claims.try_claim());
+        assert!(claims.release());
+        assert!(!claims.try_claim());
+    }
+
+    #[test]
+    fn local_claims_follow_the_same_close_protocol() {
+        let claims = LocalClaimState::new();
+        assert!(claims.try_claim());
+
+        let snapshot = claims.begin_close();
+        assert!(snapshot.has_call_claims());
+        assert!(!claims.try_claim());
+        assert!(!claims.release());
+        assert!(claims.release());
+        assert!(!claims.try_claim());
+    }
+
+    #[test]
+    fn claim_counter_rejects_overflow() {
+        let claims = AtomicClaimState {
+            state: AtomicU32::new(CLAIMS_COUNT_MASK),
+        };
+
+        assert!(!claims.try_claim());
+    }
+
+    #[test]
+    fn single_threaded_direct_pointer_representation_is_unchanged() {
+        let storage = NonNull::<InstanceStorage<Object>>::dangling().as_ptr();
+        let instance_ptr = storage.cast();
+
+        assert_eq!(direct_storage_ptr::<Object>(instance_ptr), storage);
+    }
 }
 
 /// Reports destruction during Godot->Rust call; see <https://github.com/godot-rust/gdext/pull/1671>.

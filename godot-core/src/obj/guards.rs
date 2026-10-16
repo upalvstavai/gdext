@@ -8,14 +8,13 @@
 use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
 
-#[cfg(feature = "experimental-threads")]
-use godot_cell::blocking::{InaccessibleGuard, MutGuard, RefGuard};
-#[cfg(not(feature = "experimental-threads"))]
-use godot_cell::panicking::{InaccessibleGuard, MutGuard, RefGuard};
 use godot_ffi::out;
 
 use crate::obj::script::ScriptInstance;
 use crate::obj::{AsDyn, BorrowedGd, Gd, GodotClass};
+use crate::storage::{
+    InaccessibleGuard, InstanceStorage, MutGuard, RefGuard, Storage, StorageClaim,
+};
 
 /// Immutably/shared bound reference guard for a [`Gd`][crate::obj::Gd] smart pointer.
 ///
@@ -23,13 +22,22 @@ use crate::obj::{AsDyn, BorrowedGd, Gd, GodotClass};
 // GdRef could technically implement Clone, but it wasn't needed so far.
 #[derive(Debug)]
 pub struct GdRef<'a, T: GodotClass> {
+    // Fields drop in declaration order: the borrow guard must go before the lifetime claim which owns the allocation it points into.
     guard: RefGuard<'a, T>,
+    _claim: StorageClaim<T>,
 }
 
 impl<'a, T: GodotClass> GdRef<'a, T> {
-    pub(crate) fn from_guard(guard: RefGuard<'a, T>) -> Self {
+    pub(crate) fn from_claim(claim: StorageClaim<T>) -> Self {
+        // SAFETY: `_claim` is stored in the returned guard and is declared after `guard`, so it outlives the guard and drops second.
+        let storage: &'a InstanceStorage<T> = unsafe { claim.storage_unbounded() };
+        let guard = storage.get();
+
         crate::task::await_point_inc();
-        Self { guard }
+        Self {
+            guard,
+            _claim: claim,
+        }
     }
 }
 
@@ -55,13 +63,22 @@ impl<T: GodotClass> Drop for GdRef<'_, T> {
 /// See [`Gd::bind_mut`][crate::obj::Gd::bind_mut] for usage.
 #[derive(Debug)]
 pub struct GdMut<'a, T: GodotClass> {
+    // See `GdRef`: the guard must drop before the allocation claim.
     guard: MutGuard<'a, T>,
+    _claim: StorageClaim<T>,
 }
 
 impl<'a, T: GodotClass> GdMut<'a, T> {
-    pub(crate) fn from_guard(guard: MutGuard<'a, T>) -> Self {
+    pub(crate) fn from_claim(claim: StorageClaim<T>) -> Self {
+        // SAFETY: `_claim` outlives `guard` and drops after it.
+        let storage: &'a InstanceStorage<T> = unsafe { claim.storage_unbounded() };
+        let guard = storage.get_mut();
+
         crate::task::await_point_inc();
-        Self { guard }
+        Self {
+            guard,
+            _claim: claim,
+        }
     }
 }
 

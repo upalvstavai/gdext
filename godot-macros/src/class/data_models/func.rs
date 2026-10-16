@@ -64,6 +64,7 @@ pub fn make_virtual_callback(
     signature_info: &SignatureInfo,
     before_kind: BeforeKind,
     interface_trait: Option<&venial::TypeExpr>,
+    unsafe_threaded: bool,
 ) -> TokenStream {
     let method_name = &signature_info.method_name;
 
@@ -73,6 +74,7 @@ pub fn make_virtual_callback(
         signature_info,
         before_kind,
         interface_trait,
+        true,
     );
     let sig_params = signature_info.params_type();
     let sig_ret = &signature_info.return_type;
@@ -82,6 +84,50 @@ pub fn make_virtual_callback(
         method_name.to_string().as_str(),
     );
     let invocation = make_ptrcall_invocation(&wrapped_method, true);
+
+    let callback_invocation = if unsafe_threaded {
+        quote! {
+            // SAFETY: this callback was selected by interface-wide `#[godot_api(unsafe_threaded)]` or method-level
+            // `#[func(unsafe_threaded)]`. Together with the class's explicit `unsafe impl ThreadedGodotClass`, that promises the
+            // callback and its generated marshalling use only operations valid in this Godot thread context.
+            unsafe { sys::with_threaded_callback_scope(__gdext_threaded_token, || #invocation) }
+        }
+    } else {
+        invocation.clone()
+    };
+
+    let handled_callback = quote! {
+        ::godot::private::handle_fallible_ptrcall(
+            &call_ctx,
+            || {
+                // Claim before argument unmarshalling. For blocking classes, this either linearizes before the free callback closes
+                // admission or fails without letting the storage counter be resurrected.
+                let __gdext_storage_claim =
+                    unsafe { ::godot::private::as_storage::<#class_name>(instance_ptr) };
+                // Enter only after taking the claim. Reverse drop order then revokes worker-thread FFI access before a final claim can
+                // deallocate the user instance (including running its Drop implementation) on this thread.
+                let __gdext_result = #callback_invocation;
+                // Keep the outer claim alive across synchronous argument unmarshalling and the forwarding function. The forwarding
+                // function itself must remain a non-capturing closure so it can coerce to Signature::in_ptrcall's function pointer.
+                drop(__gdext_storage_claim);
+                __gdext_result
+            }
+        )
+    };
+
+    let complete_callback = if unsafe_threaded {
+        quote! {
+            // Hold the binding-lifetime lease across the complete trampoline, including panic conversion and error logging after the user
+            // method returns. The inner scope above grants worker-thread binding access only while marshalling and invoking the method.
+            unsafe {
+                sys::with_threaded_callback_admission(|__gdext_threaded_token| {
+                    #handled_callback
+                })
+            }
+        }
+    } else {
+        handled_callback
+    };
 
     quote! {
         {
@@ -95,10 +141,7 @@ pub fn make_virtual_callback(
                 ret: sys::GDExtensionTypePtr,
             ) {
                 let call_ctx = #call_ctx;
-                ::godot::private::handle_fallible_ptrcall(
-                    &call_ctx,
-                    || #invocation
-                );
+                #complete_callback;
             }
             Some(virtual_fn)
         }
@@ -130,6 +173,7 @@ pub fn make_method_registration(
         signature_info,
         BeforeKind::Without,
         interface_trait,
+        false,
     );
 
     let default_parameters = make_default_argument_vec(
@@ -342,11 +386,26 @@ fn make_forwarding_closure(
     signature_info: &SignatureInfo,
     before_kind: BeforeKind,
     interface_trait: Option<&venial::TypeExpr>,
+    preclaimed_storage: bool,
 ) -> TokenStream {
     let method_name = &signature_info.method_name;
     let params = &signature_info.param_idents;
     let params_tuple = signature_info.params_tuple();
     let param_ident = Ident::new("params", signature_info.params_span);
+
+    let storage_decl = if preclaimed_storage {
+        quote! {
+            // SAFETY: the generated virtual trampoline owns a storage claim for the complete synchronous `in_ptrcall` invocation.
+            let storage = unsafe {
+                ::godot::private::as_weak_storage::<#class_name>(instance_ptr)
+            };
+        }
+    } else {
+        quote! {
+            let storage =
+                unsafe { ::godot::private::as_storage::<#class_name>(instance_ptr) };
+        }
+    };
 
     let instance_decl = match &signature_info.receiver_type {
         ReceiverType::Ref => quote! {
@@ -414,8 +473,7 @@ fn make_forwarding_closure(
                 |instance_ptr, #param_ident| {
                     let #params_tuple #sig_tuple_annotation = #param_ident;
 
-                    let storage =
-                        unsafe { ::godot::private::as_storage::<#class_name>(instance_ptr) };
+                    #storage_decl
 
                     #instance_decl
                     #before_method_call
@@ -440,8 +498,7 @@ fn make_forwarding_closure(
                     // Not using `virtual_sig`, since virtual methods with `#[func(gd_self)]` are being moved out of the trait to inherent impl.
                     let #params_tuple #sig_tuple_annotation = #param_ident;
 
-                    let storage =
-                        unsafe { ::godot::private::as_storage::<#class_name>(instance_ptr) };
+                    #storage_decl
 
                     #before_method_call
                     #class_name::#method_name(::godot::private::Storage::get_gd(&*storage), #(#params),*)
