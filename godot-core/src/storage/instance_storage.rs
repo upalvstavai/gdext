@@ -813,6 +813,109 @@ fn release_godot_claim_ordered(
     }
 }
 
+/// Reports destruction during Godot->Rust call; see <https://github.com/godot-rust/gdext/pull/1671>.
+fn report_destruction_during_call<T: GodotClass>(storage: &InstanceStorage<T>) {
+    let class_id = T::class_id();
+    let instance_id = storage.base().instance_id_unchecked();
+
+    sys::defer_startup_error!(
+        once_per: class_id;
+        "Godot object destroyed during Godot->Rust call; Gd {{ id: {instance_id}, class: {class_id} }}.\n  \
+        Engine may access freed object afterwards, which is UB. Reported once per class.\n  \
+        Quick'n'dirty workarounds (prefer clean destruction order):\n  \
+        * Ref-counted objects: keep alive with self.to_gd().run_deferred_gd(|_| {{}})\n  \
+        * Manually managed objects: defer the free() to idle time, e.g. using queue_free()."
+    );
+}
+
+/// Reports that the storage is destroyed while the Rust object is still borrowed. May crash the process, depending on safeguard level.
+fn report_destruction_while_bound<T: GodotClass>(storage: &InstanceStorage<T>) {
+    // We cannot panic here, since this code is invoked from a C callback. Panicking would mean unwinding into C code, which is UB.
+    // We have the following options:
+    // 1. Print an error as a best-effort, knowing that UB is likely to occur whenever the user will access &T or &mut T. (Technically, the
+    //    mere existence of these references is UB since the T is dead.)
+    // 2. Abort the process. This is the safest option, but a very drastic measure, and not what gdext does elsewhere.
+    //    We can use Godot's OS.crash() API here.
+    // 3. Change everything to "C-unwind" API. Would make the FFI unwinding safe, but still not clear if Godot would handle it appropriately.
+    //    Even if yes, it's likely the same behavior as OS.crash().
+    // 4. Prevent destruction of the Rust part (InstanceStorage). This would solve the immediate problem of &T and &mut T becoming invalid,
+    //    but it would leave a zombie object behind, where all base operations and Godot interactions suddenly fail, which likely creates
+    //    its own set of edge cases. It would _also_ make the problem less observable, since the user can keep interacting with the Rust
+    //    object and slowly accumulate memory leaks.
+    //    - Letting Gd<T> and InstanceStorage<T> know about this specific object state and panicking in the next Rust call might be an option,
+    //      but we still can't control direct access to the T.
+    //
+    // For now we choose option 2 in strict+balanced levels, and 4 in disengaged level.
+    let error = format!(
+        "Godot object destroyed during active bind() or bind_mut() guard; {:?}.\n  \
+        This is a bug in your code that may cause UB and logic errors. Make sure that objects are not\n  \
+        destroyed while you still hold a Rust reference to them, or use Gd::free() which is safe.",
+        storage.base()
+    );
+
+    // In strict+balanced level, crash which may trigger breakpoint.
+    // In disengaged level, leak Rust object (Godot philosophy: don't crash if somehow avoidable). Likely leads to follow-up issues.
+    if cfg!(safeguards_balanced) {
+        let error = crate::builtin::GString::from(&error);
+        crate::classes::Os::singleton().crash(&error);
+    } else {
+        godot_error!("{}", error);
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// InstanceCache polymorphism, no-op for engine-defined types
+
+pub(crate) trait InstanceCache: Clone {
+    fn null() -> Self;
+}
+
+impl InstanceCache for () {
+    fn null() -> Self {} // returns ()
+}
+
+impl InstanceCache for Cell<sys::GDExtensionClassInstancePtr> {
+    fn null() -> Self {
+        Cell::new(ptr::null_mut())
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Callbacks
+
+pub fn nop_instance_callbacks() -> sys::GDExtensionInstanceBindingCallbacks {
+    // These could also be null pointers, if they are definitely not invoked (e.g. create_callback only passed to object_get_instance_binding(),
+    // when there is already a binding). Current "empty but not null" impl corresponds to godot-cpp (wrapped.hpp).
+    sys::GDExtensionInstanceBindingCallbacks {
+        create_callback: Some(create_callback),
+        free_callback: Some(free_callback),
+        reference_callback: Some(reference_callback),
+    }
+}
+
+extern "C" fn create_callback(
+    _p_token: *mut std::os::raw::c_void,
+    _p_instance: *mut std::os::raw::c_void,
+) -> *mut std::os::raw::c_void {
+    // There is no "instance binding" for Godot types like Node3D -- this would be the user-defined Rust class
+    ptr::null_mut()
+}
+
+extern "C" fn free_callback(
+    _p_token: *mut std::os::raw::c_void,
+    _p_instance: *mut std::os::raw::c_void,
+    _p_binding: *mut std::os::raw::c_void,
+) {
+}
+
+extern "C" fn reference_callback(
+    _p_token: *mut std::os::raw::c_void,
+    _p_binding: *mut std::os::raw::c_void,
+    _p_reference: sys::GDExtensionBool,
+) -> sys::GDExtensionBool {
+    true as u8
+}
+
 #[cfg(test)]
 mod claim_tests {
     use std::ptr::NonNull;
@@ -915,107 +1018,4 @@ mod claim_tests {
 
         assert_eq!(direct_storage_ptr::<Object>(instance_ptr), storage);
     }
-}
-
-/// Reports destruction during Godot->Rust call; see <https://github.com/godot-rust/gdext/pull/1671>.
-fn report_destruction_during_call<T: GodotClass>(storage: &InstanceStorage<T>) {
-    let class_id = T::class_id();
-    let instance_id = storage.base().instance_id_unchecked();
-
-    sys::defer_startup_error!(
-        once_per: class_id;
-        "Godot object destroyed during Godot->Rust call; Gd {{ id: {instance_id}, class: {class_id} }}.\n  \
-        Engine may access freed object afterwards, which is UB. Reported once per class.\n  \
-        Quick'n'dirty workarounds (prefer clean destruction order):\n  \
-        * Ref-counted objects: keep alive with self.to_gd().run_deferred_gd(|_| {{}})\n  \
-        * Manually managed objects: defer the free() to idle time, e.g. using queue_free()."
-    );
-}
-
-/// Reports that the storage is destroyed while the Rust object is still borrowed. May crash the process, depending on safeguard level.
-fn report_destruction_while_bound<T: GodotClass>(storage: &InstanceStorage<T>) {
-    // We cannot panic here, since this code is invoked from a C callback. Panicking would mean unwinding into C code, which is UB.
-    // We have the following options:
-    // 1. Print an error as a best-effort, knowing that UB is likely to occur whenever the user will access &T or &mut T. (Technically, the
-    //    mere existence of these references is UB since the T is dead.)
-    // 2. Abort the process. This is the safest option, but a very drastic measure, and not what gdext does elsewhere.
-    //    We can use Godot's OS.crash() API here.
-    // 3. Change everything to "C-unwind" API. Would make the FFI unwinding safe, but still not clear if Godot would handle it appropriately.
-    //    Even if yes, it's likely the same behavior as OS.crash().
-    // 4. Prevent destruction of the Rust part (InstanceStorage). This would solve the immediate problem of &T and &mut T becoming invalid,
-    //    but it would leave a zombie object behind, where all base operations and Godot interactions suddenly fail, which likely creates
-    //    its own set of edge cases. It would _also_ make the problem less observable, since the user can keep interacting with the Rust
-    //    object and slowly accumulate memory leaks.
-    //    - Letting Gd<T> and InstanceStorage<T> know about this specific object state and panicking in the next Rust call might be an option,
-    //      but we still can't control direct access to the T.
-    //
-    // For now we choose option 2 in strict+balanced levels, and 4 in disengaged level.
-    let error = format!(
-        "Godot object destroyed during active bind() or bind_mut() guard; {:?}.\n  \
-        This is a bug in your code that may cause UB and logic errors. Make sure that objects are not\n  \
-        destroyed while you still hold a Rust reference to them, or use Gd::free() which is safe.",
-        storage.base()
-    );
-
-    // In strict+balanced level, crash which may trigger breakpoint.
-    // In disengaged level, leak Rust object (Godot philosophy: don't crash if somehow avoidable). Likely leads to follow-up issues.
-    if cfg!(safeguards_balanced) {
-        let error = crate::builtin::GString::from(&error);
-        crate::classes::Os::singleton().crash(&error);
-    } else {
-        godot_error!("{}", error);
-    }
-}
-
-// ----------------------------------------------------------------------------------------------------------------------------------------------
-// InstanceCache polymorphism, no-op for engine-defined types
-
-pub(crate) trait InstanceCache: Clone {
-    fn null() -> Self;
-}
-
-impl InstanceCache for () {
-    fn null() -> Self {} // returns ()
-}
-
-impl InstanceCache for Cell<sys::GDExtensionClassInstancePtr> {
-    fn null() -> Self {
-        Cell::new(ptr::null_mut())
-    }
-}
-
-// ----------------------------------------------------------------------------------------------------------------------------------------------
-// Callbacks
-
-pub fn nop_instance_callbacks() -> sys::GDExtensionInstanceBindingCallbacks {
-    // These could also be null pointers, if they are definitely not invoked (e.g. create_callback only passed to object_get_instance_binding(),
-    // when there is already a binding). Current "empty but not null" impl corresponds to godot-cpp (wrapped.hpp).
-    sys::GDExtensionInstanceBindingCallbacks {
-        create_callback: Some(create_callback),
-        free_callback: Some(free_callback),
-        reference_callback: Some(reference_callback),
-    }
-}
-
-extern "C" fn create_callback(
-    _p_token: *mut std::os::raw::c_void,
-    _p_instance: *mut std::os::raw::c_void,
-) -> *mut std::os::raw::c_void {
-    // There is no "instance binding" for Godot types like Node3D -- this would be the user-defined Rust class
-    ptr::null_mut()
-}
-
-extern "C" fn free_callback(
-    _p_token: *mut std::os::raw::c_void,
-    _p_instance: *mut std::os::raw::c_void,
-    _p_binding: *mut std::os::raw::c_void,
-) {
-}
-
-extern "C" fn reference_callback(
-    _p_token: *mut std::os::raw::c_void,
-    _p_binding: *mut std::os::raw::c_void,
-    _p_reference: sys::GDExtensionBool,
-) -> sys::GDExtensionBool {
-    true as u8
 }
