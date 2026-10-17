@@ -51,7 +51,7 @@ use private::Sealed;
 
 use crate::obj::cap::GodotDefault;
 use crate::obj::{Bounds, Gd, GodotClass, RawGd};
-use crate::storage::{InstanceCache, Storage};
+use crate::storage::InstanceCache;
 use crate::sys;
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------

@@ -14,7 +14,6 @@ use crate::meta::ClassId;
 use crate::meta::inspect::EnumConstant;
 use crate::obj::{Base, BaseMut, BaseRef, BorrowedGd, Bounds, Gd, bounds};
 use crate::signal::SignalObject;
-use crate::storage::Storage;
 
 /// Makes `T` eligible to be managed by Godot and stored in [`Gd<T>`][crate::obj::Gd] pointers.
 ///

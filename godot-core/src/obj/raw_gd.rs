@@ -21,7 +21,7 @@ use crate::obj::rtti::ObjectRtti;
 use crate::obj::{
     Bounds, ClassThreading, Gd, GdDerefTarget, GdMut, GdRef, GodotClass, InstanceId, bounds,
 };
-use crate::storage::{InstanceCache, InstanceStorage, StorageClaim};
+use crate::storage::{InstanceCache, StorageClaim, WeakStorage};
 use crate::{classes, meta, out};
 
 /// Low-level bindings for object pointers in Godot.
@@ -543,7 +543,7 @@ where
     /// The only time when a `&mut` reference can be taken to a `InstanceStorage` is when it is constructed
     /// or destroyed. So it is sufficient to ensure that the storage is not created or destroyed during the
     /// lifetime `'b`.
-    pub(crate) unsafe fn storage_unbounded<'b>(&self) -> Option<&'b InstanceStorage<T>> {
+    pub(crate) unsafe fn storage_unbounded<'b>(&self) -> Option<WeakStorage<'b, T>> {
         // SAFETY: instance pointer belongs to this instance. We only get a shared reference, no exclusive access, so even
         // calling this from multiple Gd pointers is safe.
         //

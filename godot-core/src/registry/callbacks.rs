@@ -27,7 +27,7 @@ use crate::obj::{
 use crate::private::{IntoVirtualMethodReceiver, PanicPayload, handle_panic};
 use crate::registry::info::PropertyInfo;
 use crate::registry::shard::ErasedDynGd;
-use crate::storage::{InstanceStorage, Storage, StorageRefCounted, as_storage, try_as_storage};
+use crate::storage::{as_storage, construct_instance_storage, try_as_storage};
 
 struct MethodCallContext<'a> {
     class_id: ClassId,
@@ -200,10 +200,9 @@ where
         "Unable to construct instance – Base was freed during initialization"
     );
 
-    let instance = InstanceStorage::<T>::construct(user_instance, base);
     let instance_ptr = handle_panic(
         &context,
-        std::panic::AssertUnwindSafe(|| instance.into_instance_ptr()),
+        std::panic::AssertUnwindSafe(|| construct_instance_storage(user_instance, base)),
     )?;
 
     let binding_data_callbacks = crate::storage::nop_instance_callbacks();

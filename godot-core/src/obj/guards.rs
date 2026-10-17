@@ -12,9 +12,7 @@ use godot_ffi::out;
 
 use crate::obj::script::ScriptInstance;
 use crate::obj::{AsDyn, BorrowedGd, Gd, GodotClass};
-use crate::storage::{
-    InaccessibleGuard, InstanceStorage, MutGuard, RefGuard, Storage, StorageClaim,
-};
+use crate::storage::{InaccessibleGuard, MutGuard, RefGuard, StorageClaim};
 
 /// Immutably/shared bound reference guard for a [`Gd`][crate::obj::Gd] smart pointer.
 ///
@@ -30,8 +28,7 @@ pub struct GdRef<'a, T: GodotClass> {
 impl<'a, T: GodotClass> GdRef<'a, T> {
     pub(crate) fn from_claim(claim: StorageClaim<T>) -> Self {
         // SAFETY: `_claim` is stored in the returned guard and is declared after `guard`, so it outlives the guard and drops second.
-        let storage: &'a InstanceStorage<T> = unsafe { claim.storage_unbounded() };
-        let guard = storage.get();
+        let guard: RefGuard<'a, T> = unsafe { claim.get_unbounded() };
 
         crate::task::await_point_inc();
         Self {
@@ -71,8 +68,7 @@ pub struct GdMut<'a, T: GodotClass> {
 impl<'a, T: GodotClass> GdMut<'a, T> {
     pub(crate) fn from_claim(claim: StorageClaim<T>) -> Self {
         // SAFETY: `_claim` outlives `guard` and drops after it.
-        let storage: &'a InstanceStorage<T> = unsafe { claim.storage_unbounded() };
-        let guard = storage.get_mut();
+        let guard: MutGuard<'a, T> = unsafe { claim.get_mut_unbounded() };
 
         crate::task::await_point_inc();
         Self {
