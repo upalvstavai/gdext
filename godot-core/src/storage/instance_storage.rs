@@ -1262,14 +1262,29 @@ mod claim_tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn concrete_storage_layout_preserves_single_threaded_baseline() {
+        let expected_single_threaded_size = if cfg!(safeguards_strict) {
+            120
+        } else if cfg!(safeguards_balanced) {
+            40
+        } else {
+            32
+        };
+        let expected_blocking_size = if cfg!(safeguards_strict) {
+            144
+        } else if cfg!(safeguards_balanced) {
+            64
+        } else {
+            56
+        };
+
         assert_eq!(
             std::mem::size_of::<InstanceStorage<Object>>(),
-            if cfg!(safeguards_strict) { 120 } else { 40 },
+            expected_single_threaded_size,
             "ordinary user classes must retain the pre-threading storage allocation size",
         );
         assert_eq!(
             std::mem::size_of::<BlockingInstanceStorage<Object>>(),
-            if cfg!(safeguards_strict) { 144 } else { 64 },
+            expected_blocking_size,
         );
         assert_eq!(
             std::mem::size_of::<StorageClaim<Object>>(),
