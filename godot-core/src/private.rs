@@ -85,10 +85,10 @@ sys::shard_registry!(pub __GODOT_DOCS_REGISTRY: DocsShard);
 thread_local! {
     static LAST_CALL_ERROR: Cell<Option<CallError>> = const { Cell::new(None) };
 
-    // Depth of active Rust-initiated out-calls to Godot on the class out-call path (`out_class_varcall`, reached via
-    // `call`/`try_call`). When > 0, we're waiting for an FFI round-trip. If Godot re-enters Rust and a `#[func]` fails,
-    // the Rust caller will observe the error via the `CallResult`/`CallError` return -- so the in-Godot print would
-    // just be noise. Panic prints are still emitted (backtrace info is worth keeping regardless of out-call context).
+    // Depth of active Rust-initiated varcall round-trips to Godot. When > 0, we're waiting for an FFI callback result.
+    // If Godot re-enters Rust and a `#[func]` fails, the Rust caller will observe the error via the
+    // `CallResult`/`CallError` return -- so the in-Godot print would just be noise. Panic prints are still emitted
+    // (backtrace info is worth keeping regardless of out-call context).
     static OUT_CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -475,7 +475,7 @@ where
 // The GDScript VM interprets any non-OK code as "call failed, abort calling function", which is what we want. The "Bug: ..." print is
 // unavoidable at the VM level (no GDExtension code maps to a clean message); the preceding godot-rust `CallError` print carries the
 // actual diagnostic information.
-const CALL_FAILED_STATUS: sys::GDExtensionCallErrorType = 1337;
+pub(crate) const CALL_FAILED_STATUS: sys::GDExtensionCallErrorType = 1337;
 
 /// Invokes a function with the _varcall_ calling convention, handling both expected errors and user panics.
 ///
@@ -799,6 +799,33 @@ mod tests {
         assert!(
             call_error_take().is_none(),
             "TLS must be drained after check_out_varcall"
+        );
+    }
+
+    #[test]
+    fn stale_tls_is_not_attached_to_a_distinct_godot_failure() {
+        use std::error::Error as _;
+
+        use crate::meta::error::CallError;
+
+        call_error_store(make(100));
+
+        let call_ctx = CallContext::outbound("Object", "call");
+        let godot_err = sys::GDExtensionCallError {
+            error: sys::GDEXTENSION_CALL_ERROR_TOO_FEW_ARGUMENTS,
+            argument: 2,
+            expected: 3,
+        };
+        let error = CallError::check_out_varcall(&call_ctx, godot_err, &[], &[])
+            .expect_err("Godot-side call error must fail");
+
+        assert!(
+            error.source().is_none(),
+            "a rich Rust error is valid only together with godot-rust's private failure status"
+        );
+        assert!(
+            call_error_take().is_none(),
+            "stale TLS must still be drained"
         );
     }
 

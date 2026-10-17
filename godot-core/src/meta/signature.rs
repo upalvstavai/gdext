@@ -174,9 +174,6 @@ impl<Params: OutParamTuple, Ret: EngineFromGodot> Signature<Params, Ret> {
             object_ptr: ValidatedObject::object_ptr(validated_obj.as_ref()),
         };
 
-        // Silence inbound `#[func]` failure prints during this out-call; caller observes the error via the returned `CallError`.
-        let _guard = crate::private::OutCallGuard::new();
-
         // SAFETY: caller guarantees that `method_bind` matches the object and expects these arguments.
         let variant = args.with_variants(|explicit_args| unsafe {
             out_varcall(&call_ctx, target, explicit_args, varargs)
@@ -645,8 +642,16 @@ unsafe fn out_varcall(
     let call = |return_ptr| {
         let mut err = sys::default_call_error();
 
-        // SAFETY: guaranteed by this function's caller.
-        unsafe { target.invoke(&variant_ptrs, return_ptr, &mut err) };
+        {
+            // Keep the rich inbound `#[func]` error channel live only for the actual FFI call. Argument preparation, error formatting,
+            // returned-Variant destruction, and user-defined return conversion happen outside this scope, so re-entry from those phases
+            // cannot leave an unrelated CallError stranded in TLS. The callback stores its error synchronously on this thread, and the next
+            // statement takes it without running user code in between.
+            let _guard = crate::private::OutCallGuard::new();
+
+            // SAFETY: guaranteed by this function's caller.
+            unsafe { target.invoke(&variant_ptrs, return_ptr, &mut err) };
+        }
 
         CallError::check_out_varcall(call_ctx, err, explicit_args, varargs)
     };

@@ -145,8 +145,8 @@ impl CallError {
         explicit_args: &[Variant],
         varargs: &[Variant],
     ) -> Result<(), Self> {
-        // Always drain stale thread-local errors (even on success), so that entries left over from previous `#[func]` failures
-        // (invoked by GDScript, not via Rust `try_call`) cannot be misattributed to a later call.
+        // Always drain the thread-local slot, even on success. Normal engine/GDScript calls do not retain entries, but defensive draining
+        // prevents an injected or otherwise stale value from being misattributed to a later call.
         let source_error = crate::private::call_error_take();
 
         if err.error == sys::GDEXTENSION_CALL_OK {
@@ -161,9 +161,9 @@ impl CallError {
         };
         let call_expr = format!("{call_ctx}({explicit_args_str}{vararg_str})");
 
-        // Check if the error originated from our own code (e.g. a #[func] returning Err or a panic).
-        // If so, use the rich CallError stashed in the thread-local rather than decoding the opaque Godot error struct.
-        if source_error.is_some() {
+        // Check if the error originated from our own code (e.g. a #[func] returning Err or a panic). A stale rich error must never be attached
+        // to a distinct Godot failure from the same synchronous call chain; only our private status establishes that correlation.
+        if err.error == crate::private::CALL_FAILED_STATUS && source_error.is_some() {
             let mut call_error = Self::new(call_ctx, String::new(), None);
             call_error.b.call_expr = call_expr;
             call_error.b.source = source_error.map(SourceError::Call);
