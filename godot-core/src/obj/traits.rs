@@ -103,6 +103,12 @@ pub enum ClassThreading {
 /// Godot API. The global `experimental-threads` feature does not replace any of the three explicit opt-ins, and `lazy-function-tables` is
 /// incompatible with `#[class(unsafe_threaded)]`.
 ///
+/// Prefer the interface-level form unless every supported Godot version documents a stable per-method threading contract for that interface.
+/// One engine operation may call several virtuals on the same worker (for example, a resource load can identify a loader before calling its
+/// `load` virtual), and that call graph may change between engine versions. If Godot dispatches an unselected virtual from a worker, the
+/// ordinary callback rejects the call fail-stop; the operation does not silently become safe. The method-level form is therefore an advanced
+/// opt-in whose complete worker callback set the implementor must establish and test for every supported engine version and code path.
+///
 /// Blocking storage grants one OS thread access to an instance at a time: while that thread holds any borrow, every borrow from another thread
 /// waits, including shared/shared access. Reentrant shared borrows on the same thread are allowed; a conflicting mutable re-entry fails. There
 /// is no timeout or deadlock detection.
@@ -116,6 +122,10 @@ pub enum ClassThreading {
 /// - call only Godot APIs documented as valid in that callback's thread context. In particular, never call `base()`, `base_mut()`, or
 ///   `to_gd()`, access the class's `Base<T>` field, obtain a `Gd<Self>`, or operate on any other Godot object unless that exact operation is
 ///   documented as worker-safe. Blocking storage protects only the Rust instance, not the Godot object or scene tree;
+/// - keep the underlying Godot object alive until every callback which may use it has returned. In particular, an owner of a registered
+///   ref-counted extension object must retain a strong `Gd`, stop dispatching new worker jobs, drain the already dispatched jobs, unregister
+///   the engine object, and only then release that final reference. Blocking storage cannot keep the engine's C++ object alive, and dropping
+///   the final `Gd` during an active callback leaves Godot with a dangling `this` even though the Rust allocation itself remains claim-protected;
 /// - keep any global or shared state synchronized;
 /// - avoid lock-order cycles. In particular, while a callback holds its receiver borrow, it must not wait for or call an operation that can
 ///   synchronously dispatch another thread to the same instance. The same rule applies to external locks acquired around such calls;

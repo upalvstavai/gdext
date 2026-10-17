@@ -970,11 +970,11 @@ pub fn get_class_extra_docs(class_name: &TyName) -> Option<&'static str> {
             "Godot may invoke custom `ResourceFormatLoader` virtual methods from resource worker threads. \
             A loader which accepts that unsafe contract must use all three explicit opt-ins: \
             `#[class(unsafe_threaded)]`, an `unsafe impl` of \
-            [`ThreadedGodotClass`](crate::obj::ThreadedGodotClass), and callback selection. Use \
-            `#[godot_api(unsafe_threaded)]` on `IResourceFormatLoader` when every regular virtual in the implementation is safe in a worker, \
-            or use `#[func(unsafe_threaded)]` on only the regular virtual methods Godot may invoke there. Unselected methods remain ordinary \
-            callbacks and may use `Base` under their normal main-thread contract. The opt-in does not make arbitrary Godot APIs thread-safe. \
-            The global `experimental-threads` feature does not replace these opt-ins. See \
+            [`ThreadedGodotClass`](crate::obj::ThreadedGodotClass), and `#[godot_api(unsafe_threaded)]` on the complete \
+            `IResourceFormatLoader` implementation. A threaded load can call several loader virtuals while selecting and loading a resource, \
+            and that set may vary with the engine version and code path, so method-level selection is not recommended for this interface. \
+            The opt-in does not make arbitrary Godot APIs thread-safe. The global `experimental-threads` feature does not replace these \
+            opt-ins. See \
             [`ThreadedGodotClass`](crate::obj::ThreadedGodotClass) for the complete safety contract."
         }
         "WeakRef" => {

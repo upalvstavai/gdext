@@ -707,7 +707,8 @@ use crate::util::{KvParser, bail, ident};
 ///
 /// // SAFETY: the overridden virtuals' complete ABIs are valid in ResourceLoader workers; they use only synchronized Rust state and worker-safe
 /// // value marshalling, never access `base` or another Godot object, and neither `WorkerLoader` nor its fields call Godot from `Drop`. The owner
-/// // unregisters the loader and waits for outstanding loads before extension deinitialization.
+/// // retains its strong `Gd`, stops issuing loads, drains outstanding loads, unregisters the loader, and only then releases that final
+/// // reference; it also drains callbacks before extension deinitialization.
 /// unsafe impl godot::obj::ThreadedGodotClass for WorkerLoader {}
 ///
 /// #[godot_api(unsafe_threaded)]
@@ -737,80 +738,40 @@ use crate::util::{KvParser, bail, ident};
 /// }
 /// ```
 ///
-/// The method-level form leaves unmarked virtuals under their ordinary callback contract. In this example, the integration's thread contract
-/// allows only `load` to run on a resource worker; `get_resource_type` stays unmarked and can therefore use the base object when Godot calls it
-/// on the main thread:
-///
-/// ```no_run
-/// use std::sync::atomic::{AtomicU64, Ordering};
-///
-/// use godot::classes::{IResourceFormatLoader, ResourceFormatLoader};
-/// use godot::prelude::*;
-///
-/// #[derive(GodotClass)]
-/// #[class(base = ResourceFormatLoader, unsafe_threaded)]
-/// struct SelectiveLoader {
-///     loads: AtomicU64,
-///     base: Base<ResourceFormatLoader>,
-/// }
-///
-/// // SAFETY: only `load` is selected below, and its complete callback ABI uses worker-safe values and synchronized Rust state. The owner
-/// // stops and drains worker loads before unloading the extension, and dropping this class does not call Godot.
-/// unsafe impl godot::obj::ThreadedGodotClass for SelectiveLoader {}
-///
-/// #[godot_api]
-/// impl IResourceFormatLoader for SelectiveLoader {
-///     fn init(base: Base<ResourceFormatLoader>) -> Self {
-///         Self {
-///             loads: AtomicU64::new(0),
-///             base,
-///         }
-///     }
-///
-///     fn get_resource_type(&self, _path: GString) -> GString {
-///         // This unmarked virtual keeps the ordinary main-thread contract.
-///         self.base().get_class()
-///     }
-///
-///     #[func(unsafe_threaded)]
-///     fn load(
-///         &self,
-///         _path: GString,
-///         _original_path: GString,
-///         _use_sub_threads: bool,
-///         _cache_mode: i32,
-///     ) -> Variant {
-///         self.loads.fetch_add(1, Ordering::Relaxed);
-///         Variant::nil()
-///     }
-/// }
-/// ```
-///
-/// A method can keep its ordinary callback contract on a target without worker-thread dispatch by applying the method and class opt-ins under
-/// the same configuration. The conditional method form is deliberately limited to `cfg_attr(condition, func(unsafe_threaded))`; the unsafe
-/// trait implementation must use that condition as well:
-///
-/// ```no_run
-/// # use godot::prelude::*;
-/// #[derive(GodotClass)]
-/// #[cfg_attr(not(target_arch = "wasm32"), class(base = Node, init, unsafe_threaded))]
-/// #[cfg_attr(target_arch = "wasm32", class(base = Node, init))]
-/// struct PortableNode;
-///
-/// #[cfg(not(target_arch = "wasm32"))]
-/// unsafe impl godot::obj::ThreadedGodotClass for PortableNode {}
-///
-/// #[godot_api]
-/// impl INode for PortableNode {
-///     #[cfg_attr(not(target_arch = "wasm32"), func(unsafe_threaded))]
-///     fn process(&mut self, _delta: f64) {}
-/// }
-/// ```
+/// Prefer the interface-level form unless every supported Godot version documents a stable per-method threading contract for that interface.
+/// A single engine operation can invoke several virtuals on its worker, and that call graph can differ by engine version and code path. The
+/// method-level form is an advanced opt-in: the implementor must identify, select, and test the complete worker callback set for every
+/// supported version. If an unselected virtual is dispatched from a worker, its ordinary callback rejects the call fail-stop.
+/// `ResourceFormatLoader` should use the interface-level form because a threaded load performs loader recognition before calling `load`.
 ///
 /// `lazy-function-tables` is incompatible with this opt-in and causes a compile-time error. Enabling the global `experimental-threads` feature
 /// does not replace the class attribute, unsafe trait implementation, or callback selection. Prefer the default storage unless Godot itself
 /// invokes the selected extension virtuals off the main thread. This API is experimental and may change as Godot exposes more precise
 /// thread-safety metadata.
+///
+/// The class attribute requires an explicit unsafe contract implementation:
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base = Node, unsafe_threaded)]
+/// struct MissingThreadedContract;
+/// ```
+///
+/// Every ordinary Rust field must be `Send`; the recognized `Base<T>` field is checked by the separate base-object rules in the contract:
+///
+/// ```compile_fail
+/// # use std::rc::Rc;
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(no_init, base = Node, unsafe_threaded)]
+/// struct NonSendThreadedClass {
+///     value: Rc<()>,
+///     base: Base<Node>,
+/// }
+///
+/// unsafe impl godot::obj::ThreadedGodotClass for NonSendThreadedClass {}
+/// ```
 ///
 ///
 /// # Further field customization
@@ -957,6 +918,11 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// `#[func(unsafe_threaded)]` on each selected regular virtual. Unmarked virtuals remain ordinary callbacks and may use `Base` under their
 /// normal main-thread contract.
 ///
+/// The method-level form is an advanced opt-in. Use it only where every supported Godot version documents a stable per-method threading
+/// contract, and test every engine path which can call the interface. One operation may call several virtuals from the same worker; an
+/// unselected worker callback is rejected fail-stop rather than being made safe automatically. Prefer interface-wide selection for
+/// `ResourceFormatLoader`, whose threaded load path performs loader recognition before calling `load`.
+///
 /// Neither callback-selection form admits constructors or registration, `to_string`, notifications, property hooks, or exported inherent
 /// `#[func]` callbacks. The method-level marker is rejected on those special callbacks, and it cannot be combined with `#[func(gd_self)]`;
 /// interface-wide selection likewise does not support a regular virtual using `#[func(gd_self)]`.
@@ -966,6 +932,22 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// including argument and return-value marshalling, value destruction, synchronous re-entry, and extension teardown. See
 /// [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html) for the requirements and [`GodotClass`] for a complete three-part example.
 /// The global `experimental-threads` feature does not replace these opt-ins, and `lazy-function-tables` is incompatible with them.
+///
+/// An interface-wide opt-in without the class-level storage opt-in is rejected:
+///
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base = Node)]
+/// struct MissingInterfaceClassOptIn;
+///
+/// unsafe impl godot::obj::ThreadedGodotClass for MissingInterfaceClassOptIn {}
+///
+/// #[godot_api(unsafe_threaded)]
+/// impl INode for MissingInterfaceClassOptIn {
+///     fn process(&mut self, _delta: f64) {}
+/// }
+/// ```
 ///
 /// A method-level opt-in without the class-level storage opt-in is rejected:
 ///
