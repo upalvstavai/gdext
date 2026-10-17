@@ -152,8 +152,40 @@ impl LocalClaimState {
 ///
 /// `begin_close()` atomically forbids new claims while retaining Godot's distinguished claim. A successful `try_claim()` therefore either
 /// linearizes before close and is counted until it releases, or observes close and fails; the counter can never be resurrected from zero.
-pub(super) struct AtomicClaimState {
-    state: AtomicU32,
+pub(super) trait AtomicClaimWord {
+    fn load(&self, order: Ordering) -> u32;
+    fn fetch_or(&self, value: u32, order: Ordering) -> u32;
+    fn compare_exchange_weak(
+        &self,
+        current: u32,
+        new: u32,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u32, u32>;
+}
+
+impl AtomicClaimWord for AtomicU32 {
+    fn load(&self, order: Ordering) -> u32 {
+        self.load(order)
+    }
+
+    fn fetch_or(&self, value: u32, order: Ordering) -> u32 {
+        self.fetch_or(value, order)
+    }
+
+    fn compare_exchange_weak(
+        &self,
+        current: u32,
+        new: u32,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u32, u32> {
+        self.compare_exchange_weak(current, new, success, failure)
+    }
+}
+
+pub(super) struct AtomicClaimState<A = AtomicU32> {
+    state: A,
 }
 
 impl AtomicClaimState {
@@ -162,7 +194,9 @@ impl AtomicClaimState {
             state: AtomicU32::new(1),
         }
     }
+}
 
+impl<A: AtomicClaimWord> AtomicClaimState<A> {
     pub(super) fn try_claim(&self) -> bool {
         let mut state = self.state.load(Ordering::Acquire);
 
@@ -924,10 +958,31 @@ mod claim_tests {
     use std::thread;
 
     use super::{
-        AtomicClaimState, CLAIMS_COUNT_MASK, InstanceStorage, LocalClaimState, direct_storage_ptr,
-        release_godot_claim_ordered,
+        AtomicClaimState, AtomicClaimWord, CLAIMS_COUNT_MASK, InstanceStorage, LocalClaimState,
+        direct_storage_ptr, release_godot_claim_ordered,
     };
     use crate::classes::Object;
+
+    #[cfg(not(target_family = "wasm"))]
+    impl AtomicClaimWord for loom::sync::atomic::AtomicU32 {
+        fn load(&self, order: Ordering) -> u32 {
+            self.load(order)
+        }
+
+        fn fetch_or(&self, value: u32, order: Ordering) -> u32 {
+            self.fetch_or(value, order)
+        }
+
+        fn compare_exchange_weak(
+            &self,
+            current: u32,
+            new: u32,
+            success: Ordering,
+            failure: Ordering,
+        ) -> Result<u32, u32> {
+            self.compare_exchange_weak(current, new, success, failure)
+        }
+    }
 
     #[test]
     fn godot_claim_pins_storage_through_concurrent_destruction_report() {
@@ -987,6 +1042,54 @@ mod claim_tests {
         assert!(!claims.try_claim());
         assert!(claims.release());
         assert!(!claims.try_claim());
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn loom_explores_claim_against_close_and_exactly_one_side_deallocates() {
+        let mut model = loom::model::Builder::new();
+        // Two simultaneous callbacks plus teardown produce an unbounded number of equivalent retries because production deliberately uses
+        // compare_exchange_weak. Two preemptions still cover every pairwise boundary: claim/claim, claim/close, and release/release.
+        model.preemption_bound = Some(2);
+        model.check(|| {
+            use loom::sync::Arc;
+            use loom::sync::atomic::{AtomicU32 as LoomAtomicU32, AtomicUsize};
+            use loom::thread;
+
+            let claims = Arc::new(AtomicClaimState::<LoomAtomicU32> {
+                state: LoomAtomicU32::new(1),
+            });
+            let deallocations = Arc::new(AtomicUsize::new(0));
+
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let worker_claims = Arc::clone(&claims);
+                    let worker_deallocations = Arc::clone(&deallocations);
+                    thread::spawn(move || {
+                        if worker_claims.try_claim() && worker_claims.release() {
+                            worker_deallocations.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                })
+                .collect();
+
+            let closer_claims = Arc::clone(&claims);
+            let closer_deallocations = Arc::clone(&deallocations);
+            let closer = thread::spawn(move || {
+                closer_claims.begin_close();
+                if closer_claims.release() {
+                    closer_deallocations.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            closer.join().unwrap();
+
+            assert_eq!(deallocations.load(Ordering::SeqCst), 1);
+            assert!(!claims.try_claim());
+        });
     }
 
     #[test]
