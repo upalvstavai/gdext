@@ -32,6 +32,9 @@ mod reentrant_test;
 #[cfg(since_api = "4.4")]
 mod self_destruct_test;
 mod singleton_test;
+// Kept separate from global `experimental-threads`, and excluded from lazy-function-table jobs.
+#[cfg(feature = "threaded-callbacks")]
+mod threaded_resource_loader_test;
 // `validate_property` is only supported in Godot 4.2+.
 mod base_init_test;
 mod validate_property_test;

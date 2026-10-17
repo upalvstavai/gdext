@@ -16,6 +16,9 @@ codegen-full = ["godot/__codegen-full"]
 codegen-full-experimental = ["codegen-full", "godot/experimental-godot-api"]
 upcoming-editor-placeholders = ["godot/upcoming-editor-placeholders"]
 experimental-threads = ["godot/experimental-threads"]
+# Builds the native worker-callback integration test. Kept explicit because
+# `godot/lazy-function-tables` deliberately rejects this API at compile time.
+threaded-callbacks = []
 register-docs = ["godot/register-docs"]
 serde = ["dep:serde", "dep:serde_json", "godot/serde"]
 test-gdextension-dependency = ["dep:itest-dependency"]

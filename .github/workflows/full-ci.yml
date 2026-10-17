@@ -172,6 +172,10 @@ jobs:
       - name: "Test"
         run: cargo test $TEST_FEATURES ${{ matrix.rust-extra-args }}
 
+      - name: "Model-check threaded callback admission"
+        if: matrix.name == 'linux' && matrix.rust-special == ''
+        run: RUSTFLAGS="--cfg loom" cargo test -p godot-ffi --lib loom_threaded_callback_admission_tests
+
   unit-test-web:
     name: unit-test-web (${{ matrix.name }})
     runs-on: ubuntu-24.04
@@ -268,7 +272,7 @@ jobs:
             artifact-name: macos-arm-nightly
             os: macos-15
             godot-binary: godot.macos.editor.dev.arm64
-            rust-extra-args: --features itest/upcoming-editor-placeholders
+            rust-extra-args: --features itest/upcoming-editor-placeholders,itest/threaded-callbacks
             hot-reload: stable signal-test
 
             # api-custom on macOS arm64 not working, due to clang linker issues.
@@ -295,7 +299,7 @@ jobs:
             artifact-name: windows-nightly
             os: windows-2025
             godot-binary: godot.windows.editor.dev.x86_64.exe
-            rust-extra-args: --features itest/upcoming-editor-placeholders
+            rust-extra-args: --features itest/upcoming-editor-placeholders,itest/threaded-callbacks
             hot-reload: stable signal-test
 
           - name: windows-double
@@ -330,7 +334,7 @@ jobs:
             # ]]
             os: ubuntu-24.04
             godot-binary: godot.linuxbsd.editor.dev.x86_64
-            rust-extra-args: --features itest/codegen-full,itest/test-gdextension-dependency
+            rust-extra-args: --features itest/codegen-full,itest/test-gdextension-dependency,itest/threaded-callbacks
             rust-extra-env: GDRUST_MAIN_EXTENSION=IntegrationTests
             hot-reload: api-custom signal-test
 
@@ -377,6 +381,7 @@ jobs:
             godot-prebuilt-patch: "4.7"
             os: ubuntu-24.04
             godot-binary: godot.linuxbsd.editor.dev.x86_64
+            rust-extra-args: --features itest/threaded-callbacks
             hot-reload: api-4-7 signal-test
 
           # Default API level (no api-* feature); runs against its matching stable binary.
@@ -385,6 +390,7 @@ jobs:
             #godot-prebuilt-patch: '4.6'
             os: ubuntu-24.04
             godot-binary: godot.linuxbsd.editor.dev.x86_64
+            rust-extra-args: --features itest/threaded-callbacks
             hot-reload: stable signal-test
 
           - name: linux-4.5
@@ -392,6 +398,7 @@ jobs:
             godot-prebuilt-patch: "4.5"
             os: ubuntu-24.04
             godot-binary: godot.linuxbsd.editor.dev.x86_64
+            rust-extra-args: --features itest/threaded-callbacks
             hot-reload: api-4-5 signal-test
 
           - name: linux-4.4
@@ -399,6 +406,7 @@ jobs:
             godot-prebuilt-patch: "4.4"
             os: ubuntu-24.04
             godot-binary: godot.linuxbsd.editor.dev.x86_64
+            rust-extra-args: --features itest/threaded-callbacks
             hot-reload: api-4-4 signal-test
 
           - name: linux-4.3
@@ -406,7 +414,7 @@ jobs:
             godot-prebuilt-patch: "4.3"
             os: ubuntu-24.04
             godot-binary: godot.linuxbsd.editor.dev.x86_64
-            rust-extra-args: --features itest/upcoming-editor-placeholders # enabled at 4.3 boundary
+            rust-extra-args: --features itest/upcoming-editor-placeholders,itest/threaded-callbacks # enabled at 4.3 boundary
             hot-reload: api-4-3
 
           # Can be disabled in the future (already covered by memcheck). For now kept on to differentiate quicker.
@@ -415,7 +423,7 @@ jobs:
             godot-prebuilt-patch: "4.2"
             os: ubuntu-24.04
             godot-binary: godot.linuxbsd.editor.dev.x86_64
-            rust-extra-args: --features itest/upcoming-editor-placeholders # enabled before 4.3 boundary
+            rust-extra-args: --features itest/upcoming-editor-placeholders,itest/threaded-callbacks # enabled before 4.3 boundary
             hot-reload: api-4-2
 
           # Memory checks: special Godot binaries compiled with AddressSanitizer/LeakSanitizer to detect UB/leaks. Always Linux.

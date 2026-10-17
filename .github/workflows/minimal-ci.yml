@@ -127,6 +127,9 @@ jobs:
       - name: "Test"
         run: cargo test $TEST_FEATURES
 
+      - name: "Model-check threaded callback admission"
+        run: RUSTFLAGS="--cfg loom" cargo test -p godot-ffi --lib loom_threaded_callback_admission_tests
+
       - name: "Run doctest in minimal feature set"
         run: cargo test --doc --no-default-features
 
@@ -186,7 +189,7 @@ jobs:
             artifact-name: macos-arm-nightly
             os: macos-15
             godot-binary: godot.macos.editor.dev.arm64
-            rust-extra-args: --features itest/upcoming-editor-placeholders
+            rust-extra-args: --features itest/upcoming-editor-placeholders,itest/threaded-callbacks
 
           # Windows
 
@@ -194,7 +197,7 @@ jobs:
             artifact-name: windows-nightly
             os: windows-2025
             godot-binary: godot.windows.editor.dev.x86_64.exe
-            rust-extra-args: --features itest/upcoming-editor-placeholders
+            rust-extra-args: --features itest/upcoming-editor-placeholders,itest/threaded-callbacks
 
           # Linux
 
@@ -208,7 +211,7 @@ jobs:
             # ]]
             os: ubuntu-24.04
             godot-binary: godot.linuxbsd.editor.dev.x86_64
-            rust-extra-args: --features itest/codegen-full,itest/test-gdextension-dependency
+            rust-extra-args: --features itest/codegen-full,itest/test-gdextension-dependency,itest/threaded-callbacks
             rust-extra-env: GDRUST_MAIN_EXTENSION=IntegrationTests
             hot-reload: stable signal-test
 
@@ -228,6 +231,7 @@ jobs:
             godot-prebuilt-patch: '4.7'
             os: ubuntu-24.04
             godot-binary: godot.linuxbsd.editor.dev.x86_64
+            rust-extra-args: --features itest/threaded-callbacks
 
           # Default API level (no api-* feature); runs against its matching stable binary.
           - name: linux-4.6
@@ -235,6 +239,7 @@ jobs:
             #godot-prebuilt-patch: '4.6'
             os: ubuntu-24.04
             godot-binary: godot.linuxbsd.editor.dev.x86_64
+            rust-extra-args: --features itest/threaded-callbacks
 
           # Minimum supported version.
           - name: linux-4.2
@@ -242,7 +247,7 @@ jobs:
             godot-prebuilt-patch: '4.2'
             os: ubuntu-24.04
             godot-binary: godot.linuxbsd.editor.dev.x86_64
-            rust-extra-args: --features itest/upcoming-editor-placeholders # enabled before 4.3 boundary
+            rust-extra-args: --features itest/upcoming-editor-placeholders,itest/threaded-callbacks # enabled before 4.3 boundary
 
           # Memory checker (always Linux). One representative sanitizer run; the safeguard-level variants run in full-ci.
 
