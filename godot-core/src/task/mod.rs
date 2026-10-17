@@ -13,14 +13,12 @@
 
 mod async_runtime;
 mod futures;
-mod main_thread_transfer;
 
 // Public re-exports
 pub use async_runtime::{TaskHandle, spawn};
 pub use futures::{
     DynamicSend, FallibleSignalFuture, FallibleSignalFutureError, IntoDynamicSend, SignalFuture,
 };
-pub use main_thread_transfer::MainThreadTransfer;
 
 // For use in integration tests.
 #[cfg(feature = "itest")]
