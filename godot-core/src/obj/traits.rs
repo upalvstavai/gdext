@@ -104,8 +104,8 @@ pub enum ClassThreading {
 /// code. Rejection is fail-stop: the generated `extern "C"` trampoline panics before it can produce an ABI return value, so the process may
 /// terminate rather than report a recoverable operation error. Registration remains part of Godot's serialized main-thread extension
 /// lifecycle.
-/// An ordinary callback may run on a worker only as synchronous same-thread re-entry from the dynamic scope of a selected virtual; that
-/// complete reentrant path is then part of the interface's unsafe contract.
+/// An ordinary callback may run on a worker only as synchronous same-thread re-entry from the dynamic scope of a virtual in the opted-in
+/// interface; that complete reentrant path is then part of the interface's unsafe contract.
 ///
 /// The whole regular interface is selected deliberately: one engine operation may call several virtuals on the same worker (for example, a
 /// resource load can identify a loader before calling its `load` virtual), and that call graph may change between engine versions. The unsafe
@@ -119,7 +119,7 @@ pub enum ClassThreading {
 /// The recognized [`Base`] field is deliberately excluded from the generated `Send` checks. Its embedded `Gd` is held in `ManuallyDrop`, so
 /// destroying storage never performs a Godot reference-count operation, and its framework-owned initialization tracker is destroyed only
 /// after storage has quiesced. This narrow representation exception does not make `Base` usable on a worker thread; accessing or moving it in
-/// a selected callback remains covered by the prohibition below.
+/// an opted-in interface callback remains covered by the prohibition below.
 ///
 /// # Safety
 ///

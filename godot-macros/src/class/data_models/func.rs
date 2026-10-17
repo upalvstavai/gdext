@@ -85,18 +85,7 @@ pub fn make_virtual_callback(
     );
     let invocation = make_ptrcall_invocation(&wrapped_method, true);
 
-    let callback_invocation = if unsafe_threaded {
-        quote! {
-            // SAFETY: this callback was selected by interface-wide `#[godot_api(unsafe_threaded)]`. Together with the class's explicit
-            // `unsafe impl ThreadedGodotClass`, that promises the callback and its generated marshalling use only operations valid in this
-            // Godot thread context.
-            unsafe { sys::with_threaded_callback_scope(__gdext_threaded_token, || #invocation) }
-        }
-    } else {
-        invocation.clone()
-    };
-
-    let handled_callback = quote! {
+    let ordinary_handled_callback = quote! {
         ::godot::private::handle_fallible_ptrcall(
             &call_ctx,
             || {
@@ -106,7 +95,7 @@ pub fn make_virtual_callback(
                     unsafe { ::godot::private::as_storage::<#class_name>(instance_ptr) };
                 // Enter only after taking the claim. Reverse drop order then revokes worker-thread FFI access before a final claim can
                 // deallocate the user instance (including running its Drop implementation) on this thread.
-                let __gdext_result = #callback_invocation;
+                let __gdext_result = #invocation;
                 // Keep the outer claim alive across synchronous argument unmarshalling and the forwarding function. The forwarding
                 // function itself must remain a non-capturing closure so it can coerce to Signature::in_ptrcall's function pointer.
                 drop(__gdext_storage_claim);
@@ -117,18 +106,26 @@ pub fn make_virtual_callback(
 
     let complete_callback = if unsafe_threaded {
         quote! {
-            // Hold the binding-lifetime lease across the complete trampoline, including panic conversion and error logging after the user
-            // method returns. The inner scope above grants worker-thread binding access only while marshalling and invoking the method.
+            // Hold the binding-lifetime lease across the complete trampoline. Claim the instance before entering worker FFI permission, then
+            // keep panic conversion, error logging, and error-payload destruction inside that permission together with ABI marshalling and
+            // the user method. The claim drops only after the scope is revoked, so final `Self::drop` cannot use worker FFI permission.
             unsafe {
                 sys::with_threaded_callback_admission(|__gdext_threaded_token| {
-                    #handled_callback
+                    let __gdext_storage_claim =
+                        unsafe { ::godot::private::as_storage::<#class_name>(instance_ptr) };
+                    unsafe {
+                        sys::with_threaded_callback_scope(__gdext_threaded_token, || {
+                            ::godot::private::handle_fallible_ptrcall(&call_ctx, || #invocation)
+                        })
+                    };
+                    drop(__gdext_storage_claim);
                 })
             }
         }
     } else {
         quote! {
             // Blocking storage makes the instance claim itself safe on a worker, so an
-            // unselected callback needs an explicit thread check before the generic panic
+            // callback outside the opted-in interface needs an explicit thread check before the generic panic
             // catcher and before any claim or argument unmarshalling. Keep the binding alive
             // across the whole ordinary trampoline for explicitly threaded classes, too.
             unsafe {
@@ -138,7 +135,7 @@ pub fn make_virtual_callback(
                         sys::ensure_ordinary_callback_thread(
                             <#class_name as ::godot::obj::GodotClass>::__UNSAFE_THREADED_OPT_IN
                         );
-                        #handled_callback
+                        #ordinary_handled_callback
                     }
                 )
             }
@@ -454,8 +451,28 @@ mod tests {
         .to_string();
 
         assert!(!callback.contains("ensure_ordinary_callback_thread"));
-        assert!(callback.contains("with_threaded_callback_admission"));
-        assert!(callback.contains("with_threaded_callback_scope"));
+        let admission = callback
+            .find("with_threaded_callback_admission")
+            .expect("threaded callback must hold a binding-lifetime admission lease");
+        let storage_claim = callback
+            .find("as_storage")
+            .expect("threaded callback must claim instance storage");
+        let worker_scope = callback
+            .find("with_threaded_callback_scope")
+            .expect("threaded callback must enter scoped worker FFI permission");
+        let panic_boundary = callback
+            .find("handle_fallible_ptrcall")
+            .expect("threaded callback must contain the panic boundary");
+        let storage_release = callback
+            .find("drop (__gdext_storage_claim)")
+            .expect("threaded callback must explicitly release instance storage");
+        assert!(
+            admission < storage_claim
+                && storage_claim < worker_scope
+                && worker_scope < panic_boundary
+                && panic_boundary < storage_release,
+            "error handling must remain inside worker permission, which must end before the storage claim drops"
+        );
     }
 
     #[test]

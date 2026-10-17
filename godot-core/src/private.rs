@@ -75,9 +75,10 @@ sys::shard_registry!(pub __GODOT_DOCS_REGISTRY: DocsShard);
 
 // Thread-local storage for rich `CallError` produced by `#[func]` methods returning `Result<T, E>`.
 //
-// When a Rust `#[func]` fails (returns Err), the error is stashed here so that Rust's `try_call()` can retrieve it
-// after the Godot round-trip. The varcall FFI callback simultaneously sets `CALL_FAILED_STATUS` so that Godot's own
-// GDScript VM recognizes the failure and aborts the calling script function.
+// When a Rust-initiated varcall re-enters a Rust `#[func]` which fails, the error is stashed here so that `try_call()` can retrieve it after
+// the Godot round-trip. Engine-initiated varcalls and every ptrcall print and destroy their error before returning from the callback instead.
+// A failed varcall simultaneously sets `CALL_FAILED_STATUS` so that Godot's own GDScript VM recognizes the failure and aborts the calling
+// script function.
 //
 // Thread-safety: varcall callbacks execute on the calling thread, and `try_call` reads the result on the same
 // thread before any other call can overwrite it. No mutex is needed.
@@ -105,8 +106,8 @@ pub(crate) fn call_error_take() -> Option<CallError> {
 
 /// RAII guard marking that a Rust-initiated out-call to Godot is in progress on this thread.
 ///
-/// While any guard is live, inbound `#[func]` failures on the same thread skip their `godot_error!` print, since the Rust
-/// caller already observes the failure via the returned `CallError`/panic and the extra print would be redundant noise.
+/// While any guard is live, inbound varcall failures on the same thread are retained for the Rust caller and skip their `godot_error!` print,
+/// since the returned `CallError` already reports the failure. Ptrcalls still print and never use the varcall return channel.
 pub(crate) struct OutCallGuard;
 
 impl OutCallGuard {
@@ -487,9 +488,10 @@ pub unsafe fn handle_fallible_varcall<F, R>(
 ) where
     F: FnOnce() -> CallResult<R> + std::panic::UnwindSafe,
 {
-    if handle_fallible_call(call_ctx, code) {
+    if handle_fallible_call(call_ctx, code, CallErrorChannel::Varcall) {
         // Use CALL_FAILED_STATUS so the GDScript VM recognizes the failure and aborts the calling function.
-        // The Rust-side CallError has been stored in the thread-local, so that try_call() can retrieve it later.
+        // A Rust-side CallError is stored in the thread-local only while a Rust out-call is waiting to retrieve it. An engine/GDScript
+        // caller has no Rust error-return channel, so its error is printed and dropped in this callback instead of surviving in TLS.
         //
         // SAFETY: `out_err` is live per caller guarantee, and `code` has returned, so no other access to it is in flight.
         unsafe {
@@ -507,14 +509,20 @@ pub fn handle_fallible_ptrcall<F>(call_ctx: &CallContext, code: F)
 where
     F: FnOnce() -> CallResult<()> + std::panic::UnwindSafe,
 {
-    handle_fallible_call(call_ctx, code);
+    handle_fallible_call(call_ctx, code, CallErrorChannel::Ptrcall);
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum CallErrorChannel {
+    Varcall,
+    Ptrcall,
 }
 
 /// Type-erases `code` and forwards to [`handle_erased_call`], so that the panic chain is compiled once instead of once per `#[func]`.
 ///
 /// Returns `true` if the call failed.
 #[inline]
-fn handle_fallible_call<F, R>(call_ctx: &CallContext, code: F) -> bool
+fn handle_fallible_call<F, R>(call_ctx: &CallContext, code: F, channel: CallErrorChannel) -> bool
 where
     F: FnOnce() -> CallResult<R> + std::panic::UnwindSafe,
 {
@@ -522,7 +530,7 @@ where
     let code_ptr = (&raw mut code).cast::<()>();
 
     // SAFETY: `code` outlives the call, and `invoke_erased` reads it exactly once.
-    unsafe { handle_erased_call(call_ctx, invoke_erased::<F, R>, code_ptr) }
+    unsafe { handle_erased_call(call_ctx, invoke_erased::<F, R>, code_ptr, channel) }
 }
 
 /// Invokes the fallible call stored at `data`, discarding its return value.
@@ -546,7 +554,8 @@ where
 ///
 /// Returns `true` if the call failed, `false` if it succeeded.
 ///
-/// On failure, the [`CallError`] is stored in thread-local storage for later retrieval via [`call_error_take`].
+/// A failed varcall stores its [`CallError`] only while a Rust out-call is waiting to retrieve it. Other errors are printed and dropped before
+/// this function returns, so their payloads cannot outlive an engine callback or extension teardown.
 ///
 /// # Safety
 /// `data` must be a valid argument for `code`, which is invoked exactly once.
@@ -554,6 +563,7 @@ unsafe fn handle_erased_call(
     call_ctx: &CallContext,
     code: unsafe fn(*mut ()) -> CallResult<()>,
     data: *mut (),
+    channel: CallErrorChannel,
 ) -> bool {
     // SAFETY: `data` is a valid argument for `code` (caller guarantee), and `handle_panic` invokes the closure exactly once.
     let outcome = handle_panic(call_ctx, || unsafe { code(data) });
@@ -569,21 +579,21 @@ unsafe fn handle_erased_call(
         Err(panic_msg) => CallError::failed_by_user_panic(call_ctx, panic_msg),
     };
 
-    handle_call_error(call_error)
+    handle_call_error(call_error, channel)
 }
 
 /// Helper for `handle_fallible_call` that does not depend on generic arguments.
 ///
 /// This is a separate non-generic function to improve compilation time of `handle_fallible_call`, which may be monomorphized thousands of
 /// times while compiling the user's crate.
-fn handle_call_error(call_error: CallError) -> bool {
+fn handle_call_error(call_error: CallError, channel: CallErrorChannel) -> bool {
+    let rust_caller_waiting =
+        channel == CallErrorChannel::Varcall && OUT_CALL_DEPTH.with(|d| d.get() > 0);
+
     // Print failed calls to Godot's console.
     //
-    // OUT_CALL_DEPTH > 0 means this failure is observed during a Rust-initiated out-call (e.g. `try_call`); the caller already sees
-    // the `CallError` via return value, so printing here would just be noise.
-    //
-    // Coverage gap: only `Signature::out_class_varcall` sets the guard. If a `#[func]` re-enters Rust via `out_utility_call`,
-    // `out_builtin_ptrcall`, or `out_script_virtual_call`, the redundant print returns. Extend the guard to those paths if reported.
+    // A Rust-initiated varcall (e.g. `try_call`) observes the error via its return value, so printing here would just be noise. Ptrcalls have no
+    // CallError return channel and must still report their error even if they occur synchronously inside a Rust out-call.
     //
     // caused_by_panic() check to avoid printing (2) once the panic message (1) is already printed:
     //
@@ -600,12 +610,14 @@ fn handle_call_error(call_error: CallError) -> bool {
     //     at: ...
     if has_error_print_level(ErrorPrintLevel::Normal)
         && !call_error.caused_by_panic()
-        && OUT_CALL_DEPTH.with(|d| d.get() == 0)
+        && !rust_caller_waiting
     {
         godot_error!("{call_error}");
     }
 
-    call_error_store(call_error);
+    if rust_caller_waiting {
+        call_error_store(call_error);
+    }
     true
 }
 
@@ -621,8 +633,17 @@ pub fn rebuild_gd(object_ref: &classes::Object) -> Gd<classes::Object> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CallError, PanicPayload, call_error_store, call_error_take};
+    use std::error::Error;
+    use std::fmt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{
+        CallError, OutCallGuard, PanicPayload, call_error_store, call_error_take,
+        handle_fallible_ptrcall, handle_fallible_varcall,
+    };
     use crate::meta::CallContext;
+    use crate::meta::error::ConvertError;
     use crate::sys;
 
     fn make(index: usize) -> CallError {
@@ -631,6 +652,23 @@ mod tests {
         let payload = PanicPayload::new(Box::new("some panic reason".to_string()));
 
         CallError::failed_by_user_panic(&ctx, payload)
+    }
+
+    #[derive(Debug)]
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl fmt::Display for DropProbe {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("drop probe")
+        }
+    }
+
+    impl Error for DropProbe {}
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
     }
 
     #[test]
@@ -658,6 +696,85 @@ mod tests {
         assert!(call_error_take().is_none());
     }
 
+    #[test]
+    fn ptrcall_error_is_dropped_before_return() {
+        let _ = call_error_take();
+        let ctx = CallContext::func("Class", "ptrcall");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let convert_error = ConvertError::with_error(DropProbe(Arc::clone(&dropped)));
+        let error = CallError::failed_param_conversion::<i64>(&ctx, 0, convert_error);
+
+        handle_fallible_ptrcall(&ctx, std::panic::AssertUnwindSafe(move || Err(error)));
+
+        assert!(
+            call_error_take().is_none(),
+            "ptrcalls have no Rust CallError return channel and must not retain payloads in TLS"
+        );
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the type-erased error payload must be destroyed before the ptrcall returns"
+        );
+    }
+
+    #[test]
+    fn engine_varcall_error_is_dropped_before_return() {
+        let _ = call_error_take();
+        let ctx = CallContext::func("Class", "engine_varcall");
+        let mut out_err = sys::GDExtensionCallError {
+            error: sys::GDEXTENSION_CALL_OK,
+            argument: 0,
+            expected: 0,
+        };
+
+        // SAFETY: out_err is a live, uniquely borrowed call-error value.
+        unsafe {
+            handle_fallible_varcall(&ctx, &raw mut out_err, || Err::<(), _>(make(4)));
+        }
+
+        assert_ne!(out_err.error, sys::GDEXTENSION_CALL_OK);
+        assert!(
+            call_error_take().is_none(),
+            "an engine/GDScript caller cannot retrieve Rust TLS errors"
+        );
+    }
+
+    #[test]
+    fn rust_out_varcall_retains_error_until_caller_takes_it() {
+        let _ = call_error_take();
+        let ctx = CallContext::func("Class", "rust_varcall");
+        let mut out_err = sys::GDExtensionCallError {
+            error: sys::GDEXTENSION_CALL_OK,
+            argument: 0,
+            expected: 0,
+        };
+        let guard = OutCallGuard::new();
+
+        // SAFETY: out_err is a live, uniquely borrowed call-error value.
+        unsafe {
+            handle_fallible_varcall(&ctx, &raw mut out_err, || Err::<(), _>(make(5)));
+        }
+
+        assert_ne!(out_err.error, sys::GDEXTENSION_CALL_OK);
+        let error = call_error_take().expect("Rust out-call must receive the rich CallError");
+        assert_eq!(error.method_name(), "method_5");
+        drop(guard);
+    }
+
+    #[test]
+    fn ptrcall_inside_rust_out_call_does_not_pollute_varcall_error_channel() {
+        let _ = call_error_take();
+        let ctx = CallContext::func("Class", "nested_ptrcall");
+        let guard = OutCallGuard::new();
+
+        handle_fallible_ptrcall(&ctx, || Err(make(6)));
+
+        assert!(
+            call_error_take().is_none(),
+            "a nested ptrcall has no CallError return channel and must not be attributed to the surrounding varcall"
+        );
+        drop(guard);
+    }
+
     /// Regression test: a stale TLS entry from an earlier `#[func]` failure must not be misattributed to a later, unrelated varcall failure.
     /// `check_out_varcall` drains TLS unconditionally, so a Godot-side error (e.g. wrong arg count) after a stale store must *not* wrap the
     /// stale error. "TLS" means thread-local storage.
@@ -665,7 +782,7 @@ mod tests {
     fn stale_tls_not_misattributed() {
         use crate::meta::error::CallError;
 
-        // Simulate a previous #[func] failure that was never consumed (e.g. GDScript was the caller).
+        // Inject a stale entry defensively. Normal engine/GDScript calls no longer retain such entries.
         call_error_store(make(99));
 
         // Simulate a subsequent varcall that succeeds -- TLS must be drained.

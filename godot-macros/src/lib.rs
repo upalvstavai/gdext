@@ -935,9 +935,9 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// may perform loader recognition before calling `load`.
 ///
 /// The opt-in does not admit constructors or registration, `to_string`, notifications, property hooks, or exported inherent `#[func]`
-/// callbacks, and it does not support a regular virtual using `#[func(gd_self)]`. Direct worker dispatch to an ordinary runtime callback is
-/// rejected before marshalling, instance access, or user code; only synchronous same-thread re-entry from an opted-in virtual is admitted
-/// under the interface's unsafe contract. Registration remains part of Godot's serialized main-thread extension lifecycle.
+/// callbacks, and the opted-in interface cannot contain a virtual using `#[func(gd_self)]`. Direct worker dispatch to an ordinary runtime
+/// callback is rejected before marshalling, instance access, or user code; only synchronous same-thread re-entry from an opted-in virtual is
+/// admitted under the interface's unsafe contract. Registration remains part of Godot's serialized main-thread extension lifecycle.
 ///
 /// Callback selection is only one part of the opt-in: the class also needs `#[class(unsafe_threaded)]` and an explicit unsafe implementation
 /// of [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html). The unsafe contract covers each regular callback's complete generated ABI,

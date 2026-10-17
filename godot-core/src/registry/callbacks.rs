@@ -100,9 +100,8 @@ fn with_ordinary_class_callback<T: GodotClass, R>(callback: impl FnOnce() -> R) 
 fn with_virtual_lookup_callback<T: GodotClass, R>(callback: impl FnOnce() -> R) -> R {
     if T::__UNSAFE_THREADED_OPT_IN {
         // SAFETY: this is the complete lazy-lookup callback. Explicit threaded opt-in permits the
-        // worker which will run the selected virtual to resolve its trampoline first. All work in
-        // this scope is framework-controlled and limited to thread-safe name conversion, immutable
-        // configuration lookup, and static function-pointer selection.
+        // worker which will run an opted-in interface virtual to resolve its trampoline first. All work in this scope is framework-controlled
+        // and limited to thread-safe name conversion, immutable configuration lookup, and static function-pointer selection.
         unsafe {
             sys::with_threaded_callback_admission(|token| {
                 sys::with_threaded_callback_scope(token, callback)
