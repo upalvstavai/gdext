@@ -102,6 +102,11 @@ pub enum ClassThreading {
 /// Godot API. The global `experimental-threads` feature does not replace any of the three explicit opt-ins, and `lazy-function-tables` is
 /// incompatible with `#[class(unsafe_threaded)]`.
 ///
+/// A direct worker-thread dispatch to any ordinary runtime callback above is rejected before argument marshalling, instance access, or user
+/// code. Registration remains part of Godot's serialized main-thread extension lifecycle.
+/// An ordinary callback may run on a worker only as synchronous same-thread re-entry from the dynamic scope of a selected virtual; that
+/// complete reentrant path is then part of the selected virtual's unsafe contract.
+///
 /// Prefer the interface-level form unless every supported Godot version documents a stable per-method threading contract for that interface.
 /// One engine operation may call several virtuals on the same worker (for example, a resource load can identify a loader before calling its
 /// `load` virtual), and that call graph may change between engine versions. If Godot dispatches an unselected virtual from a worker, the

@@ -683,7 +683,9 @@ use crate::util::{KvParser, bail, ident};
 /// This is callback-scoped. It does not permit arbitrary Rust threads to use this class or the Godot API, and it does not make `Gd`, `Base`,
 /// engine objects, or the scene tree thread-safe. Constructors and registration, `to_string`, notifications, property hooks, inherent
 /// `#[func]` methods, and unselected interface virtuals remain ordinary callbacks. Such ordinary callbacks may use `Base` under their normal
-/// main-thread contract. `#[func(unsafe_threaded)]` is accepted only on a regular engine virtual and cannot be combined with
+/// main-thread contract; direct worker dispatch to an ordinary runtime callback is rejected before marshalling, instance access, or user
+/// code. Synchronous same-thread re-entry from a selected virtual is covered by that virtual's unsafe contract. `#[func(unsafe_threaded)]` is
+/// accepted only on a regular engine virtual and cannot be combined with
 /// `#[func(gd_self)]`; an interface-wide opt-in likewise does not support virtuals using `#[func(gd_self)]`.
 ///
 /// Every non-`Base<T>` field must implement `Send`. The recognized `Base<T>` field is exempt only because its embedded `Gd` is never dropped
@@ -943,7 +945,10 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 ///
 /// Neither callback-selection form admits constructors or registration, `to_string`, notifications, property hooks, or exported inherent
 /// `#[func]` callbacks. The method-level marker is rejected on those special callbacks, and it cannot be combined with `#[func(gd_self)]`;
-/// interface-wide selection likewise does not support a regular virtual using `#[func(gd_self)]`.
+/// interface-wide selection likewise does not support a regular virtual using `#[func(gd_self)]`. Direct worker dispatch to an ordinary
+/// runtime callback is rejected before marshalling, instance access, or user code; only synchronous same-thread re-entry from a selected
+/// virtual is admitted under that selected virtual's unsafe contract. Registration remains part of Godot's serialized main-thread extension
+/// lifecycle.
 ///
 /// Callback selection is only one part of the opt-in: the class also needs `#[class(unsafe_threaded)]` and an explicit unsafe implementation
 /// of [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html). The unsafe contract covers each selected callback's complete generated ABI,

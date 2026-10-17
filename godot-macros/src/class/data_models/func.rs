@@ -252,7 +252,11 @@ pub fn make_method_registration(
                     #default_parameters,
                 );
 
-                method::ClassMethodInfo::from_signature::<CallParams, CallRet>(
+                method::ClassMethodInfo::from_signature::<
+                    CallParams,
+                    CallRet,
+                    { <#class_name as ::godot::obj::GodotClass>::__UNSAFE_THREADED_OPT_IN },
+                >(
                     __godot_class_id,
                     method_name,
                     #method_flags,
@@ -388,7 +392,10 @@ mod tests {
     use proc_macro2::Span;
     use quote::quote;
 
-    use super::{BeforeKind, ReceiverType, SignatureInfo, make_virtual_callback};
+    use super::{
+        BeforeKind, FuncDefinition, ReceiverType, SignatureInfo, make_method_registration,
+        make_virtual_callback,
+    };
     use crate::util::ident;
 
     fn primitive_virtual_signature() -> SignatureInfo {
@@ -449,6 +456,29 @@ mod tests {
         assert!(!callback.contains("ensure_ordinary_callback_thread"));
         assert!(callback.contains("with_threaded_callback_admission"));
         assert!(callback.contains("with_threaded_callback_scope"));
+    }
+
+    #[test]
+    fn inherent_method_selects_callback_vtable_without_reading_userdata() {
+        let method = FuncDefinition {
+            signature_info: primitive_virtual_signature(),
+            external_attributes: Vec::new(),
+            registered_name: None,
+            is_script_virtual: false,
+            rpc_info: None,
+            is_generated_accessor: false,
+        };
+
+        let registration = make_method_registration(&ident("ThreadedClass"), method, None)
+            .expect("primitive inherent method should register")
+            .to_string();
+
+        assert!(registration.contains("from_signature"));
+        assert!(registration.contains("__UNSAFE_THREADED_OPT_IN"));
+        assert!(
+            registration.contains("GodotClass"),
+            "the class-level const must select the callback function pointer during registration"
+        );
     }
 }
 

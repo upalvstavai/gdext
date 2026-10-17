@@ -69,6 +69,24 @@ fn handle_method_panic_bool<T: GodotClass>(
     sys::conv::bool_to_sys(succeeded)
 }
 
+/// Runs an ordinary Godot-to-Rust callback for `T` behind the explicit-threaded class boundary.
+///
+/// Ordinary classes take the direct branch and retain their existing callback path. Explicitly
+/// threaded classes first pin the binding lifetime, then reject a direct worker-thread callback
+/// before it can touch ABI values, instance storage, or user code. Same-thread synchronous re-entry
+/// from a selected threaded virtual remains allowed by the outer scoped permission.
+#[inline(always)]
+fn with_ordinary_class_callback<T: GodotClass, R>(callback: impl FnOnce() -> R) -> R {
+    // SAFETY: every call site below wraps the complete callback body, and this helper performs the
+    // required thread check as its first operation inside the admission lease.
+    unsafe {
+        sys::with_ordinary_callback_admission(T::__UNSAFE_THREADED_OPT_IN, || {
+            sys::ensure_ordinary_callback_thread(T::__UNSAFE_THREADED_OPT_IN);
+            callback()
+        })
+    }
+}
+
 /// Godot FFI default constructor.
 ///
 /// If the `init()` constructor panics, null is returned.
@@ -79,19 +97,23 @@ pub unsafe extern "C" fn create<T: cap::GodotDefault>(
     _class_userdata: *mut std::ffi::c_void,
     _notify_postinitialize: sys::GDExtensionBool,
 ) -> sys::GDExtensionObjectPtr {
-    create_custom(
-        T::__godot_user_init,
-        sys::conv::bool_from_sys(_notify_postinitialize),
-    )
-    .unwrap_or(std::ptr::null_mut())
+    with_ordinary_class_callback::<T, _>(|| {
+        create_custom(
+            T::__godot_user_init,
+            sys::conv::bool_from_sys(_notify_postinitialize),
+        )
+        .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 #[cfg(before_api = "4.4")]
 pub unsafe extern "C" fn create<T: cap::GodotDefault>(
     _class_userdata: *mut std::ffi::c_void,
 ) -> sys::GDExtensionObjectPtr {
-    // `notify_postinitialize` doesn't matter before 4.4, it's sent by Godot when constructing object and we don't send it.
-    create_custom(T::__godot_user_init, true).unwrap_or(std::ptr::null_mut())
+    with_ordinary_class_callback::<T, _>(|| {
+        // `notify_postinitialize` doesn't matter before 4.4, it's sent by Godot when constructing object and we don't send it.
+        create_custom(T::__godot_user_init, true).unwrap_or(std::ptr::null_mut())
+    })
 }
 
 /// Workaround for <https://github.com/godot-rust/gdext/issues/874> before Godot 4.5.
@@ -119,8 +141,10 @@ pub unsafe extern "C" fn recreate<T: cap::GodotDefault>(
     _class_userdata: *mut std::ffi::c_void,
     object: sys::GDExtensionObjectPtr,
 ) -> sys::GDExtensionClassInstancePtr {
-    create_rust_part_for_existing_godot_part(T::__godot_user_init, object, false)
-        .unwrap_or(std::ptr::null_mut())
+    with_ordinary_class_callback::<T, _>(|| {
+        create_rust_part_for_existing_godot_part(T::__godot_user_init, object, false)
+            .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 /// Workaround for <https://github.com/godot-rust/gdext/issues/874> before Godot 4.5.
@@ -327,15 +351,17 @@ pub unsafe extern "C" fn to_string<T: cap::GodotToString>(
     is_valid: *mut sys::GDExtensionBool,
     out_string: sys::GDExtensionStringPtr,
 ) {
-    let code = || {
-        let storage = as_storage::<T>(instance);
-        let string = T::__godot_to_string(T::Recv::instance(&storage));
-        string.move_into_string_ptr(out_string);
-        true
-    };
+    with_ordinary_class_callback::<T, _>(|| {
+        let code = || {
+            let storage = as_storage::<T>(instance);
+            let string = T::__godot_to_string(T::Recv::instance(&storage));
+            string.move_into_string_ptr(out_string);
+            true
+        };
 
-    // `is_valid` comes uninitialized and must be set. On panic, `out_string` is left untouched and reported as invalid.
-    *is_valid = handle_method_panic_bool::<T>("to_string", code);
+        // `is_valid` comes uninitialized and must be set. On panic, `out_string` is left untouched and reported as invalid.
+        *is_valid = handle_method_panic_bool::<T>("to_string", code);
+    })
 }
 
 #[expect(unsafe_op_in_unsafe_fn)] // Pointer validity asserted by Godot.
@@ -344,15 +370,17 @@ pub unsafe extern "C" fn notification<T: cap::GodotNotification>(
     what: i32,
     _reversed: sys::GDExtensionBool,
 ) {
-    // `get_mut()` can also panic on borrow conflicts, in addition to `__godot_on_notification` itself.
-    let code = || {
-        let storage = as_storage::<T>(instance);
-        let mut instance = storage.get_mut();
+    with_ordinary_class_callback::<T, _>(|| {
+        // `get_mut()` can also panic on borrow conflicts, in addition to `__godot_on_notification` itself.
+        let code = || {
+            let storage = as_storage::<T>(instance);
+            let mut instance = storage.get_mut();
 
-        T::__godot_on_notification(&mut *instance, what);
-    };
+            T::__godot_on_notification(&mut *instance, what);
+        };
 
-    let _ = handle_method_panic::<T, _>("on_notification", code);
+        let _ = handle_method_panic::<T, _>("on_notification", code);
+    })
 }
 
 #[expect(unsafe_op_in_unsafe_fn)] // Pointer validity asserted by Godot.
@@ -361,21 +389,23 @@ pub unsafe extern "C" fn get<T: cap::GodotGet>(
     name: sys::GDExtensionConstStringNamePtr,
     ret: sys::GDExtensionVariantPtr,
 ) -> sys::GDExtensionBool {
-    let code = || {
-        let storage = as_storage::<T>(instance);
-        let instance = T::Recv::instance(&storage);
-        let property = StringName::new_from_string_sys(name);
+    with_ordinary_class_callback::<T, _>(|| {
+        let code = || {
+            let storage = as_storage::<T>(instance);
+            let instance = T::Recv::instance(&storage);
+            let property = StringName::new_from_string_sys(name);
 
-        match T::__godot_on_get(instance, property) {
-            Some(value) => {
-                value.move_into_var_ptr(ret);
-                true
+            match T::__godot_on_get(instance, property) {
+                Some(value) => {
+                    value.move_into_var_ptr(ret);
+                    true
+                }
+                None => false,
             }
-            None => false,
-        }
-    };
+        };
 
-    handle_method_panic_bool::<T>("on_get", code)
+        handle_method_panic_bool::<T>("on_get", code)
+    })
 }
 
 #[expect(unsafe_op_in_unsafe_fn)] // Pointer validity asserted by Godot.
@@ -384,17 +414,19 @@ pub unsafe extern "C" fn set<T: cap::GodotSet>(
     name: sys::GDExtensionConstStringNamePtr,
     value: sys::GDExtensionConstVariantPtr,
 ) -> sys::GDExtensionBool {
-    let code = || {
-        let storage = as_storage::<T>(instance);
-        let instance = T::Recv::instance(&storage);
+    with_ordinary_class_callback::<T, _>(|| {
+        let code = || {
+            let storage = as_storage::<T>(instance);
+            let instance = T::Recv::instance(&storage);
 
-        let property = StringName::new_from_string_sys(name);
-        let value = Variant::new_from_var_sys(value);
+            let property = StringName::new_from_string_sys(name);
+            let value = Variant::new_from_var_sys(value);
 
-        T::__godot_on_set(instance, property, value)
-    };
+            T::__godot_on_set(instance, property, value)
+        };
 
-    handle_method_panic_bool::<T>("on_set", code)
+        handle_method_panic_bool::<T>("on_set", code)
+    })
 }
 
 pub unsafe extern "C" fn reference<T: GodotClass>(instance: sys::GDExtensionClassInstancePtr) {
@@ -451,34 +483,36 @@ pub unsafe extern "C" fn get_property_list<T: cap::GodotGetPropertyList>(
     instance: sys::GDExtensionClassInstancePtr,
     count: *mut u32,
 ) -> *const sys::GDExtensionPropertyInfo {
-    let code = || -> *const sys::GDExtensionPropertyInfo {
-        let storage = as_storage::<T>(instance);
-        let instance = T::Recv::instance(&storage);
+    with_ordinary_class_callback::<T, _>(|| {
+        let code = || -> *const sys::GDExtensionPropertyInfo {
+            let storage = as_storage::<T>(instance);
+            let instance = T::Recv::instance(&storage);
 
-        let property_list = T::__godot_on_get_property_list(instance);
-        let property_list_sys: Box<[sys::GDExtensionPropertyInfo]> = property_list
-            .into_iter()
-            .map(|prop| prop.into_owned_property_sys())
-            .collect();
+            let property_list = T::__godot_on_get_property_list(instance);
+            let property_list_sys: Box<[sys::GDExtensionPropertyInfo]> = property_list
+                .into_iter()
+                .map(|prop| prop.into_owned_property_sys())
+                .collect();
 
-        *count = property_list_sys
-            .len()
-            .try_into()
-            .expect("property list cannot be longer than `u32::MAX`");
+            *count = property_list_sys
+                .len()
+                .try_into()
+                .expect("property list cannot be longer than `u32::MAX`");
 
-        // as_mut_ptr() rather than as_ptr(): free_property_list writes through this pointer, so it must retain mutable/exclusive
-        // pointer provenance. a `*const T` derived from `&[T]` would make that write UB.
-        Box::leak(property_list_sys).as_mut_ptr().cast_const()
-    };
+            // as_mut_ptr() rather than as_ptr(): free_property_list writes through this pointer, so it must retain mutable/exclusive
+            // pointer provenance. a `*const T` derived from `&[T]` would make that write UB.
+            Box::leak(property_list_sys).as_mut_ptr().cast_const()
+        };
 
-    handle_method_panic::<T, _>("on_get_property_list", code).unwrap_or_else(|_| {
-        // On panic, report an empty list -- `count` comes uninitialized, so it must be set in any case.
-        *count = 0;
+        handle_method_panic::<T, _>("on_get_property_list", code).unwrap_or_else(|_| {
+            // On panic, report an empty list -- `count` comes uninitialized, so it must be set in any case.
+            *count = 0;
 
-        // Same representation as above, just empty: empty boxed slice performs no allocation, but provides a non-null, aligned pointer
-        // that `free_property_list` needs to reconstruct the `Box`. Could technically use ptr::dangling() but less explicit.
-        let empty = Box::<[sys::GDExtensionPropertyInfo]>::default();
-        Box::leak(empty).as_mut_ptr().cast_const()
+            // Same representation as above, just empty: empty boxed slice performs no allocation, but provides a non-null, aligned pointer
+            // that `free_property_list` needs to reconstruct the `Box`. Could technically use ptr::dangling() but less explicit.
+            let empty = Box::<[sys::GDExtensionPropertyInfo]>::default();
+            Box::leak(empty).as_mut_ptr().cast_const()
+        })
     })
 }
 
@@ -538,9 +572,11 @@ pub unsafe extern "C" fn property_can_revert<T: cap::GodotPropertyGetRevert>(
     instance: sys::GDExtensionClassInstancePtr,
     property_name: sys::GDExtensionConstStringNamePtr,
 ) -> sys::GDExtensionBool {
-    let code = || raw_property_get_revert::<T>(instance, property_name).is_some();
+    with_ordinary_class_callback::<T, _>(|| {
+        let code = || raw_property_get_revert::<T>(instance, property_name).is_some();
 
-    handle_method_panic_bool::<T>("on_property_get_revert", code)
+        handle_method_panic_bool::<T>("on_property_get_revert", code)
+    })
 }
 
 /// # Safety
@@ -552,16 +588,18 @@ pub unsafe extern "C" fn property_get_revert<T: cap::GodotPropertyGetRevert>(
     property_name: sys::GDExtensionConstStringNamePtr,
     ret: sys::GDExtensionVariantPtr,
 ) -> sys::GDExtensionBool {
-    let code = || {
-        let Some(revert) = raw_property_get_revert::<T>(instance, property_name) else {
-            return false;
+    with_ordinary_class_callback::<T, _>(|| {
+        let code = || {
+            let Some(revert) = raw_property_get_revert::<T>(instance, property_name) else {
+                return false;
+            };
+
+            revert.move_into_var_ptr(ret);
+            true
         };
 
-        revert.move_into_var_ptr(ret);
-        true
-    };
-
-    handle_method_panic_bool::<T>("on_property_get_revert", code)
+        handle_method_panic_bool::<T>("on_property_get_revert", code)
+    })
 }
 
 /// Callback for `validate_property`.
@@ -578,19 +616,21 @@ pub unsafe extern "C" fn validate_property<T: cap::GodotValidateProperty>(
     instance: sys::GDExtensionClassInstancePtr,
     property_info_ptr: *mut sys::GDExtensionPropertyInfo,
 ) -> sys::GDExtensionBool {
-    let code = || {
-        let storage = as_storage::<T>(instance);
-        let instance = T::Recv::instance(&storage);
+    with_ordinary_class_callback::<T, _>(|| {
+        let code = || {
+            let storage = as_storage::<T>(instance);
+            let instance = T::Recv::instance(&storage);
 
-        let mut property_info = PropertyInfo::new_from_sys(property_info_ptr);
-        T::__godot_on_validate_property(instance, &mut property_info);
+            let mut property_info = PropertyInfo::new_from_sys(property_info_ptr);
+            T::__godot_on_validate_property(instance, &mut property_info);
 
-        // `property_info_ptr` remains valid and unchanged by the user callback.
-        property_info.move_into_property_info_ptr(property_info_ptr);
-        true
-    };
+            // `property_info_ptr` remains valid and unchanged by the user callback.
+            property_info.move_into_property_info_ptr(property_info_ptr);
+            true
+        };
 
-    handle_method_panic_bool::<T>("on_validate_property", code)
+        handle_method_panic_bool::<T>("on_validate_property", code)
+    })
 }
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -639,5 +679,46 @@ where
 
     ErasedDynGd {
         boxed: Box::new(obj),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_ordinary_user_callback_enters_the_class_boundary() {
+        let source = include_str!("callbacks.rs");
+        let callback_names = [
+            "create",
+            "recreate",
+            "to_string",
+            "notification",
+            "get",
+            "set",
+            "get_property_list",
+            "property_can_revert",
+            "property_get_revert",
+            "validate_property",
+        ];
+
+        for name in callback_names {
+            let needle = format!("pub unsafe extern \"C\" fn {name}<");
+            let mut found = 0;
+            for (start, _) in source.match_indices(&needle) {
+                found += 1;
+                let rest = &source[start..];
+                let end = rest
+                    .find("\n}\n")
+                    .expect("callback function must have a top-level closing brace");
+                let callback = &rest[..end + 2];
+                assert!(
+                    callback.contains("with_ordinary_class_callback::<T, _>"),
+                    "{name} must enter admission and check its thread before user code"
+                );
+            }
+            assert!(
+                found != 0,
+                "expected callback `{name}` in the boundary inventory"
+            );
+        }
     }
 }

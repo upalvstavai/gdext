@@ -88,7 +88,7 @@ impl ClassMethodInfo {
     /// # Safety
     /// `method_data`'s function must interpret its instance pointer as an instance of `class_id`, and `method_flags` must match
     /// the receiver (e.g. [`MethodFlags::STATIC`] only for functions ignoring the instance pointer).
-    pub unsafe fn from_signature<Params, Ret>(
+    pub unsafe fn from_signature<Params, Ret, const EXPLICITLY_THREADED_CLASS: bool>(
         class_id: ClassId,
         method_name: StringName,
         method_flags: MethodFlags,
@@ -101,14 +101,14 @@ impl ClassMethodInfo {
     {
         let method_userdata = method_data.into_raw();
 
-        // SAFETY: method_userdata comes from MethodUserdata::<Params, Ret>::into_raw(), so it matches VTABLE and is not aliased.
+        // SAFETY: method_userdata comes from MethodUserdata::<Params, Ret>::into_raw(), so it matches the selected vtable and is not aliased.
         unsafe {
             Self::from_erased(
                 class_id,
                 method_name,
                 method_flags,
                 param_names,
-                MethodUserdata::<Params, Ret>::VTABLE,
+                method_vtable::<Params, Ret, EXPLICITLY_THREADED_CLASS>(),
                 method_userdata,
             )
         }
@@ -351,14 +351,21 @@ impl<Params, Ret> MethodUserdata<Params, Ret> {
     }
 }
 
-impl<Params: InParamTuple, Ret: EngineToGodot> MethodUserdata<Params, Ret> {
-    const VTABLE: &'static MethodVTable = &MethodVTable {
-        call_func: Some(varcall_callback::<Params, Ret>),
-        ptrcall_func: Some(ptrcall_callback::<Params, Ret>),
-        drop_fn: Self::drop_raw,
+fn method_vtable<
+    Params: InParamTuple + 'static,
+    Ret: EngineToGodot + 'static,
+    const EXPLICITLY_THREADED_CLASS: bool,
+>() -> &'static MethodVTable {
+    // Promoted to static storage. The const generic selects a different pair of callback entry
+    // points for explicit classes, so those callbacks can enter admission before dereferencing
+    // MethodUserdata. Reading a flag from MethodUserdata first would race its teardown.
+    &MethodVTable {
+        call_func: Some(varcall_callback::<Params, Ret, EXPLICITLY_THREADED_CLASS>),
+        ptrcall_func: Some(ptrcall_callback::<Params, Ret, EXPLICITLY_THREADED_CLASS>),
+        drop_fn: MethodUserdata::<Params, Ret>::drop_raw,
         param_info_fn: sig_params::<Params>,
         return_info_fn: MethodParamOrReturnInfo::for_return::<Ret>,
-    };
+    }
 }
 
 fn default_argument_ptrs(defaults: &[Variant]) -> Vec<sys::GDExtensionVariantPtr> {
@@ -414,7 +421,11 @@ impl std::ops::Deref for MethodDefaults {
 /// # Safety
 /// `method_data` must point to a `MethodUserdata<Params, Ret>` stored by [`ClassMethodInfo::from_signature()`]; the remaining parameters must
 /// follow the varcall convention for that signature.
-unsafe extern "C" fn varcall_callback<Params: InParamTuple, Ret: EngineToGodot>(
+unsafe extern "C" fn varcall_callback<
+    Params: InParamTuple,
+    Ret: EngineToGodot,
+    const EXPLICITLY_THREADED_CLASS: bool,
+>(
     method_data: *mut c_void,
     instance_ptr: sys::GDExtensionClassInstancePtr,
     args_ptr: *const sys::GDExtensionConstVariantPtr,
@@ -422,29 +433,35 @@ unsafe extern "C" fn varcall_callback<Params: InParamTuple, Ret: EngineToGodot>(
     ret: sys::GDExtensionVariantPtr,
     err: *mut sys::GDExtensionCallError,
 ) {
-    // SAFETY: `method_data` is the pointer registered together with this function, and the data behind it is never mutated, nor freed while
-    // the method stays registered.
-    let data = unsafe { &*method_data.cast::<MethodUserdata<Params, Ret>>() };
-    let call_ctx = CallContext::func(data.header.class_name, data.header.method_name);
+    // SAFETY: this is the complete callback trampoline. For explicit classes the admission lease
+    // must precede even the first MethodUserdata read, because class teardown drops that allocation.
+    unsafe {
+        sys::with_ordinary_callback_admission(EXPLICITLY_THREADED_CLASS, || {
+            sys::ensure_ordinary_callback_thread(EXPLICITLY_THREADED_CLASS);
 
-    let code = || {
-        // SAFETY: guaranteed by this function's caller.
-        unsafe {
-            Signature::<Params, Ret>::in_varcall(
-                instance_ptr,
-                &call_ctx,
-                args_ptr,
-                arg_count,
-                &data.header.default_arguments,
-                ret,
-                err,
-                data.func,
-            )
-        }
+            // SAFETY: `method_data` is the pointer registered together with this function, and the
+            // admission lease keeps explicit-class teardown from freeing it while this call runs.
+            let data = &*method_data.cast::<MethodUserdata<Params, Ret>>();
+            let call_ctx = CallContext::func(data.header.class_name, data.header.method_name);
+
+            let code = || {
+                // SAFETY: guaranteed by this function's caller.
+                Signature::<Params, Ret>::in_varcall(
+                    instance_ptr,
+                    &call_ctx,
+                    args_ptr,
+                    arg_count,
+                    &data.header.default_arguments,
+                    ret,
+                    err,
+                    data.func,
+                )
+            };
+
+            // SAFETY: `err` points to a live call error, as guaranteed by the caller.
+            crate::private::handle_fallible_varcall(&call_ctx, err, code);
+        })
     };
-
-    // SAFETY: `err` points to a live call error, as guaranteed by the caller.
-    unsafe { crate::private::handle_fallible_varcall(&call_ctx, err, code) };
 }
 
 /// Ptrcall FFI entry point shared by all `#[func]`s with signature `(Params, Ret)`.
@@ -455,30 +472,76 @@ unsafe extern "C" fn varcall_callback<Params: InParamTuple, Ret: EngineToGodot>(
 /// # Safety
 /// `method_data` must point to a `MethodUserdata<Params, Ret>` stored by [`ClassMethodInfo::from_signature()`]; the remaining parameters must
 /// follow the ptrcall convention for that signature.
-unsafe extern "C" fn ptrcall_callback<Params: InParamTuple, Ret: EngineToGodot>(
+unsafe extern "C" fn ptrcall_callback<
+    Params: InParamTuple,
+    Ret: EngineToGodot,
+    const EXPLICITLY_THREADED_CLASS: bool,
+>(
     method_data: *mut c_void,
     instance_ptr: sys::GDExtensionClassInstancePtr,
     args_ptr: *const sys::GDExtensionConstTypePtr,
     ret: sys::GDExtensionTypePtr,
 ) {
-    // SAFETY: `method_data` is the pointer registered together with this function, and the data behind it is never mutated, nor freed while
-    // the method stays registered.
-    let data = unsafe { &*method_data.cast::<MethodUserdata<Params, Ret>>() };
-    let call_ctx = CallContext::func(data.header.class_name, data.header.method_name);
+    // SAFETY: see varcall_callback. The const-selected entry point makes admission the first
+    // operation for explicit classes, before MethodUserdata, ABI arguments, storage, or user code.
+    unsafe {
+        sys::with_ordinary_callback_admission(EXPLICITLY_THREADED_CLASS, || {
+            sys::ensure_ordinary_callback_thread(EXPLICITLY_THREADED_CLASS);
 
-    let code = || {
-        // SAFETY: guaranteed by this function's caller.
-        unsafe {
-            Signature::<Params, Ret>::in_ptrcall(
-                instance_ptr,
-                &call_ctx,
-                args_ptr,
-                ret,
-                data.func,
-                sys::PtrcallType::Standard,
-            )
-        }
+            let data = &*method_data.cast::<MethodUserdata<Params, Ret>>();
+            let call_ctx = CallContext::func(data.header.class_name, data.header.method_name);
+
+            let code = || {
+                // SAFETY: guaranteed by this function's caller.
+                Signature::<Params, Ret>::in_ptrcall(
+                    instance_ptr,
+                    &call_ctx,
+                    args_ptr,
+                    ret,
+                    data.func,
+                    sys::PtrcallType::Standard,
+                )
+            };
+
+            crate::private::handle_fallible_ptrcall(&call_ctx, code);
+        })
     };
+}
 
-    crate::private::handle_fallible_ptrcall(&call_ctx, code);
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn method_callbacks_gate_before_reading_userdata() {
+        let source = include_str!("method.rs");
+        let varcall_start = source
+            .find("unsafe extern \"C\" fn varcall_callback<")
+            .expect("varcall callback must exist");
+        let ptrcall_start = source
+            .find("unsafe extern \"C\" fn ptrcall_callback<")
+            .expect("ptrcall callback must exist");
+        let tests_start = source[ptrcall_start..]
+            .find("\n#[cfg(test)]\nmod tests")
+            .map(|offset| ptrcall_start + offset)
+            .expect("callback implementation must precede its structural tests");
+
+        for callback in [
+            &source[varcall_start..ptrcall_start],
+            &source[ptrcall_start..tests_start],
+        ] {
+            let admission = callback
+                .find("with_ordinary_callback_admission")
+                .expect("method callback must enter ordinary admission");
+            let gate = callback
+                .find("ensure_ordinary_callback_thread")
+                .expect("method callback must check its thread");
+            let userdata_read = callback
+                .find("method_data.cast")
+                .expect("method callback must read MethodUserdata");
+
+            assert!(
+                admission < gate && gate < userdata_read,
+                "admission and the thread gate must precede the first MethodUserdata dereference"
+            );
+        }
+    }
 }
