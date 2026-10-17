@@ -62,6 +62,7 @@ quote = "1.0.45"
 venial = "0.6.1"
 
 # Testing (itest).
+loom = "0.7.2"
 pin-project-lite = { version = "0.2" }
 
 # Note about Jetbrains IDEs: "IDE Sync" (Refresh Cargo projects) may cause static analysis errors such as

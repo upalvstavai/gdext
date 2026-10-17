@@ -39,6 +39,9 @@ safeguards-release-disengaged = ["godot-bindings/safeguards-release-disengaged"]
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }
+
 [build-dependencies]
 godot-bindings = { path = "../godot-bindings", version = "=0.5.5" }
 godot-codegen = { path = "../godot-codegen", version = "=0.5.5" }

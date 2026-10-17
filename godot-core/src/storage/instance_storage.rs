@@ -1045,13 +1045,10 @@ mod claim_tests {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn loom_explores_claim_against_close_and_exactly_one_side_deallocates() {
+    fn check_claim_close_model(worker_count: usize, preemption_bound: Option<usize>) {
         let mut model = loom::model::Builder::new();
-        // Two simultaneous callbacks plus teardown produce an unbounded number of equivalent retries because production deliberately uses
-        // compare_exchange_weak. Two preemptions still cover every pairwise boundary: claim/claim, claim/close, and release/release.
-        model.preemption_bound = Some(2);
-        model.check(|| {
+        model.preemption_bound = preemption_bound;
+        model.check(move || {
             use loom::sync::Arc;
             use loom::sync::atomic::{AtomicU32 as LoomAtomicU32, AtomicUsize};
             use loom::thread;
@@ -1061,7 +1058,7 @@ mod claim_tests {
             });
             let deallocations = Arc::new(AtomicUsize::new(0));
 
-            let workers: Vec<_> = (0..2)
+            let workers: Vec<_> = (0..worker_count)
                 .map(|_| {
                     let worker_claims = Arc::clone(&claims);
                     let worker_deallocations = Arc::clone(&deallocations);
@@ -1090,6 +1087,20 @@ mod claim_tests {
             assert_eq!(deallocations.load(Ordering::SeqCst), 1);
             assert!(!claims.try_claim());
         });
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn loom_exhausts_one_claim_against_close_and_exactly_one_side_deallocates() {
+        check_claim_close_model(1, None);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn loom_bounds_two_claims_against_close_and_exactly_one_side_deallocates() {
+        // Two simultaneous callbacks plus teardown produce an unbounded number of equivalent retries because production deliberately uses
+        // compare_exchange_weak. The bound keeps that state space tractable while still exercising multi-claim close/release schedules.
+        check_claim_close_model(2, Some(2));
     }
 
     #[test]

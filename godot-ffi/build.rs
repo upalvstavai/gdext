@@ -21,6 +21,7 @@ fn main() {
 
     watch.write_stats_to(&gen_path.join("ffi-stats.txt"));
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-check-cfg=cfg(loom)");
 
     godot_bindings::emit_godot_version_cfg();
     godot_bindings::emit_wasm_nothreads_cfg();

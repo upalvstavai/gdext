@@ -64,7 +64,7 @@ godot = { path = "../godot", default-features = false }
 serde_json = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-loom = "0.7.2"
+loom = { workspace = true }
 
 # https://docs.rs/about/metadata
 [package.metadata.docs.rs]

@@ -13,19 +13,34 @@ use crate::{
     GdextRuntimeMetadata, ManualInitCell, UtilityFunctionTable,
 };
 
+#[cfg(loom)]
+use loom::sync::{
+    Condvar as CallbackCondvar, Mutex as CallbackMutex, MutexGuard as CallbackMutexGuard,
+};
+#[cfg(not(loom))]
+use std::sync::{
+    Condvar as CallbackCondvar, Mutex as CallbackMutex, MutexGuard as CallbackMutexGuard,
+};
+
 #[cfg(not(feature = "experimental-threads"))]
 thread_local! {
     static THREADED_CALLBACK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(not(loom))]
 thread_local! {
     static THREADED_CALLBACK_ADMISSION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(loom)]
+loom::thread_local! {
+    static THREADED_CALLBACK_ADMISSION_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
+}
+
 #[derive(Debug, Default)]
 struct ThreadedCallbackAdmission {
-    state: std::sync::Mutex<ThreadedCallbackAdmissionState>,
-    drained: std::sync::Condvar,
+    state: CallbackMutex<ThreadedCallbackAdmissionState>,
+    drained: CallbackCondvar,
 }
 
 #[derive(Debug, Default)]
@@ -35,10 +50,10 @@ struct ThreadedCallbackAdmissionState {
 }
 
 impl ThreadedCallbackAdmission {
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, ThreadedCallbackAdmissionState> {
+    fn lock_state(&self) -> CallbackMutexGuard<'_, ThreadedCallbackAdmissionState> {
         self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn open(&self) {
@@ -52,16 +67,21 @@ impl ThreadedCallbackAdmission {
     }
 
     fn enter(&self) -> ThreadedCallbackLease<'_> {
+        self.try_enter()
+            .expect("threaded Godot callback started while the binding was not accepting callbacks")
+    }
+
+    fn try_enter(&self) -> Option<ThreadedCallbackLease<'_>> {
         let mut state = self.lock_state();
-        assert!(
-            state.accepting,
-            "threaded Godot callback started while the binding was not accepting callbacks"
-        );
+        if !state.accepting {
+            return None;
+        }
+
         state.active = state
             .active
             .checked_add(1)
             .expect("threaded callback lease count overflow");
-        ThreadedCallbackLease { admission: self }
+        Some(ThreadedCallbackLease { admission: self })
     }
 
     fn close_and_wait(&self) {
@@ -74,7 +94,7 @@ impl ThreadedCallbackAdmission {
             state = self
                 .drained
                 .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(|poison| poison.into_inner());
         }
     }
 
@@ -85,7 +105,7 @@ impl ThreadedCallbackAdmission {
             state = self
                 .drained
                 .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(|poison| poison.into_inner());
         }
     }
 }
@@ -368,6 +388,7 @@ mod tests {
 
 #[cfg(all(
     test,
+    not(loom),
     not(feature = "experimental-threads"),
     not(feature = "codegen-lazy-fptrs")
 ))]
@@ -659,6 +680,7 @@ mod threaded_callback_tests {
 
 #[cfg(all(
     test,
+    not(loom),
     feature = "experimental-threads",
     not(feature = "codegen-lazy-fptrs")
 ))]
@@ -732,6 +754,129 @@ mod experimental_threaded_callback_admission_tests {
 
         assert!(result.is_err());
         admission.close_and_wait();
+    }
+}
+
+#[cfg(all(
+    test,
+    loom,
+    not(feature = "experimental-threads"),
+    not(feature = "codegen-lazy-fptrs")
+))]
+mod loom_threaded_callback_admission_tests {
+    use std::sync::atomic::Ordering;
+
+    use loom::sync::atomic::{AtomicBool, AtomicUsize};
+    use loom::sync::{Arc, mpsc};
+    use loom::thread;
+
+    use super::{ThreadedCallbackAdmission, with_threaded_callback_admission_in};
+
+    fn check_admission_model(worker_count: usize, preemption_bound: Option<usize>) {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = preemption_bound;
+        model.check(move || {
+            let admission = Arc::new(ThreadedCallbackAdmission::default());
+            admission.open();
+            let bodies_started = Arc::new(AtomicUsize::new(0));
+            let bodies_completed = Arc::new(AtomicUsize::new(0));
+            let close_returned = Arc::new(AtomicBool::new(false));
+
+            let workers: Vec<_> = (0..worker_count)
+                .map(|_| {
+                    let admission = Arc::clone(&admission);
+                    let bodies_started = Arc::clone(&bodies_started);
+                    let bodies_completed = Arc::clone(&bodies_completed);
+                    let close_returned = Arc::clone(&close_returned);
+                    thread::spawn(move || {
+                        if let Some(lease) = admission.try_enter() {
+                            bodies_started.fetch_add(1, Ordering::SeqCst);
+                            thread::yield_now();
+                            assert!(!close_returned.load(Ordering::SeqCst));
+                            bodies_completed.fetch_add(1, Ordering::SeqCst);
+                            drop(lease);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                })
+                .collect();
+
+            let closer_admission = Arc::clone(&admission);
+            let closer_started = Arc::clone(&bodies_started);
+            let closer_completed = Arc::clone(&bodies_completed);
+            let closer_returned = Arc::clone(&close_returned);
+            let closer = thread::spawn(move || {
+                closer_admission.close_and_wait();
+                assert_eq!(
+                    closer_completed.load(Ordering::SeqCst),
+                    closer_started.load(Ordering::SeqCst)
+                );
+                closer_returned.store(true, Ordering::SeqCst);
+            });
+
+            let admitted_workers = workers
+                .into_iter()
+                .map(|worker| usize::from(worker.join().unwrap()))
+                .sum::<usize>();
+            closer.join().unwrap();
+
+            assert_eq!(bodies_started.load(Ordering::SeqCst), admitted_workers);
+            assert_eq!(bodies_completed.load(Ordering::SeqCst), admitted_workers);
+            assert!(close_returned.load(Ordering::SeqCst));
+            {
+                let state = admission.lock_state();
+                assert!(!state.accepting);
+                assert_eq!(state.active, 0);
+            }
+
+            assert!(admission.try_enter().is_none());
+        });
+    }
+
+    #[test]
+    fn loom_exhausts_one_callback_against_binding_close_and_drain() {
+        check_admission_model(1, None);
+    }
+
+    #[test]
+    fn loom_bounds_two_callbacks_against_binding_close_and_drain() {
+        // The bound keeps the multi-callback count/drain state space tractable while still exercising schedules where either admission or
+        // close wins first and where the closer waits for one or both active leases.
+        check_admission_model(2, Some(2));
+    }
+
+    #[test]
+    fn loom_exhausts_synchronous_reentry_after_close_before_outer_lease_drains() {
+        loom::model(|| {
+            let admission = Arc::new(ThreadedCallbackAdmission::default());
+            admission.open();
+            let nested_bodies = Arc::new(AtomicUsize::new(0));
+            let (outer_entered_tx, outer_entered_rx) = mpsc::channel();
+
+            let worker_admission = Arc::clone(&admission);
+            let worker_nested_bodies = Arc::clone(&nested_bodies);
+            let worker = thread::spawn(move || unsafe {
+                with_threaded_callback_admission_in(&worker_admission, |_| {
+                    outer_entered_tx.send(()).unwrap();
+                    worker_admission.wait_until_closed();
+
+                    // The outer synchronous stack still owns its lease. Re-entry after close must reuse it instead of trying to open a new
+                    // admission, otherwise teardown can deadlock while waiting for the outer callback which is waiting for its nested call.
+                    with_threaded_callback_admission_in(&worker_admission, |_| {
+                        worker_nested_bodies.fetch_add(1, Ordering::SeqCst);
+                    });
+                });
+            });
+
+            outer_entered_rx.recv().unwrap();
+            admission.close_and_wait();
+            worker.join().unwrap();
+
+            assert_eq!(nested_bodies.load(Ordering::SeqCst), 1);
+            assert!(admission.try_enter().is_none());
+        });
     }
 }
 
