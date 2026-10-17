@@ -373,6 +373,69 @@ mod tests {
     }
 
     #[test]
+    fn stale_callback_churn_never_recovers_a_reregistered_address() {
+        const LIFETIMES: usize = 500;
+        const READERS: usize = 4;
+
+        let registry = InstanceRegistry::new();
+        let mut allocation = Box::new(0usize);
+        let storage = NonNull::from(allocation.as_mut()).as_ptr();
+        let retired = Mutex::new(Vec::with_capacity(LIFETIMES));
+        let stale_resolutions = AtomicUsize::new(0);
+        let current_registered = Arc::new(Barrier::new(READERS + 1));
+        let stale_sweep_finished = Arc::new(Barrier::new(READERS + 1));
+
+        thread::scope(|scope| {
+            let readers: Vec<_> = (0..READERS)
+                .map(|_| {
+                    let registry = &registry;
+                    let retired = &retired;
+                    let stale_resolutions = &stale_resolutions;
+                    let current_registered = Arc::clone(&current_registered);
+                    let stale_sweep_finished = Arc::clone(&stale_sweep_finished);
+                    scope.spawn(move || {
+                        for _ in 0..LIFETIMES {
+                            // The writer has registered a new lifetime at the exact same address before releasing this barrier.
+                            current_registered.wait();
+                            let handles = retired.lock().unwrap().clone();
+                            for handle in handles {
+                                if registry.with_read::<usize, _>(handle, |_| ()).is_some() {
+                                    stale_resolutions.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                            stale_sweep_finished.wait();
+                        }
+                    })
+                })
+                .collect();
+
+            for lifetime in 0..LIFETIMES {
+                *allocation = lifetime;
+                let handle = registry.insert(storage).unwrap();
+
+                current_registered.wait();
+                stale_sweep_finished.wait();
+
+                assert!(registry.remove(handle, storage));
+                retired.lock().unwrap().push(handle);
+            }
+
+            for reader in readers {
+                reader.join().unwrap();
+            }
+        });
+
+        assert_eq!(stale_resolutions.load(Ordering::SeqCst), 0);
+        assert_eq!(retired.into_inner().unwrap().len(), LIFETIMES);
+        assert!(registry.shards.iter().all(|shard| {
+            shard
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        }));
+    }
+
+    #[test]
     fn parallel_handle_churn_never_duplicates_or_leaves_entries() {
         const THREADS: usize = 8;
         const INSERTIONS_PER_THREAD: usize = 1_000;

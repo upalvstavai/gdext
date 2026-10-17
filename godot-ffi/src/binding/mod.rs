@@ -573,6 +573,61 @@ mod threaded_callback_tests {
     }
 
     #[test]
+    fn close_drain_rejects_new_threads_but_preserves_synchronous_reentry() {
+        let admission = ThreadedCallbackAdmission::default();
+        admission.open();
+        let late_body_ran = AtomicBool::new(false);
+        let (outer_entered_tx, outer_entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (reenter_tx, reenter_rx) = std::sync::mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let admission_ref = &admission;
+            let outer = scope.spawn(move || unsafe {
+                with_local_admission(admission_ref, |_| {
+                    outer_entered_tx.send(()).unwrap();
+                    reenter_rx.recv().unwrap();
+
+                    // The complete outer trampoline still owns the one admitted lease. A nested callback on this same thread is part of
+                    // that synchronous call stack and must therefore remain valid after close has stopped new threads.
+                    with_threaded_callback_admission_in(admission_ref, |_| {});
+                });
+            });
+
+            outer_entered_rx.recv().unwrap();
+            let close = scope.spawn(|| admission.close_and_wait());
+            admission.wait_until_closed();
+            assert!(!close.is_finished());
+
+            // This models an engine worker which reaches a callback only after teardown has linearized. Its body must never run and its
+            // failed attempt must neither revive nor decrement the already-active outer lease.
+            let late_body_ran_ref = &late_body_ran;
+            let late = scope.spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    with_local_admission(admission_ref, |_| {
+                        late_body_ran_ref.store(true, Ordering::SeqCst);
+                    });
+                }))
+            });
+            assert!(late.join().unwrap().is_err());
+            assert!(!late_body_ran.load(Ordering::SeqCst));
+            {
+                let state = admission.lock_state();
+                assert!(!state.accepting);
+                assert_eq!(state.active, 1);
+            }
+            assert!(!close.is_finished());
+
+            reenter_tx.send(()).unwrap();
+            outer.join().unwrap();
+            close.join().unwrap();
+        });
+
+        let state = admission.lock_state();
+        assert!(!state.accepting);
+        assert_eq!(state.active, 0);
+    }
+
+    #[test]
     fn admission_can_reopen_only_after_a_complete_close() {
         let admission = ThreadedCallbackAdmission::default();
 
