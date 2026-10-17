@@ -684,8 +684,9 @@ use crate::util::{KvParser, bail, ident};
 /// engine objects, or the scene tree thread-safe. Constructors and registration, `to_string`, notifications, property hooks, inherent
 /// `#[func]` methods, and unselected interface virtuals remain ordinary callbacks. Such ordinary callbacks may use `Base` under their normal
 /// main-thread contract; direct worker dispatch to an ordinary runtime callback is rejected before marshalling, instance access, or user
-/// code. Synchronous same-thread re-entry from a selected virtual is covered by that virtual's unsafe contract. `#[func(unsafe_threaded)]` is
-/// accepted only on a regular engine virtual and cannot be combined with
+/// code. This is fail-stop: the generated `extern "C"` trampoline panics before it can produce an ABI return value, so the process may
+/// terminate rather than report a recoverable operation error. Synchronous same-thread re-entry from a selected virtual is covered by that
+/// virtual's unsafe contract. `#[func(unsafe_threaded)]` is accepted only on a regular engine virtual and cannot be combined with
 /// `#[func(gd_self)]`; an interface-wide opt-in likewise does not support virtuals using `#[func(gd_self)]`.
 ///
 /// Every non-`Base<T>` field must implement `Send`. The recognized `Base<T>` field is exempt only because its embedded `Gd` is never dropped

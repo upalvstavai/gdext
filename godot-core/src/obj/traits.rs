@@ -103,7 +103,9 @@ pub enum ClassThreading {
 /// incompatible with `#[class(unsafe_threaded)]`.
 ///
 /// A direct worker-thread dispatch to any ordinary runtime callback above is rejected before argument marshalling, instance access, or user
-/// code. Registration remains part of Godot's serialized main-thread extension lifecycle.
+/// code. Rejection is fail-stop: the generated `extern "C"` trampoline panics before it can produce an ABI return value, so the process may
+/// terminate rather than report a recoverable operation error. Registration remains part of Godot's serialized main-thread extension
+/// lifecycle.
 /// An ordinary callback may run on a worker only as synchronous same-thread re-entry from the dynamic scope of a selected virtual; that
 /// complete reentrant path is then part of the selected virtual's unsafe contract.
 ///

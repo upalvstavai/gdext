@@ -150,7 +150,7 @@
 //!
 //! * **`experimental-threads`**
 //!
-//!   Legacy, process-wide experimental threading support. This selects synchronized instance storage for every user class and disables several
+//!   Process-wide experimental threading support. This selects synchronized instance storage for every user class and disables several
 //!   main-thread binding checks, but it does not verify that ordinary user classes are `Send` or prove that an engine callback is valid on a
 //!   worker. A non-`Send` class which Godot actually invokes or destroys there can therefore still be unsound. The narrower callback path uses
 //!   explicit `#[class(unsafe_threaded)]`, `unsafe impl godot::obj::ThreadedGodotClass`, and either interface-wide
