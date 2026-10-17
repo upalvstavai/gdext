@@ -153,8 +153,8 @@
 //!   Process-wide experimental threading support. This selects synchronized instance storage for every user class and disables several
 //!   main-thread binding checks, but it does not verify that ordinary user classes are `Send` or prove that an engine callback is valid on a
 //!   worker. A non-`Send` class which Godot actually invokes or destroys there can therefore still be unsound. The narrower callback path uses
-//!   explicit `#[class(unsafe_threaded)]`, `unsafe impl godot::obj::ThreadedGodotClass`, and either interface-wide
-//!   `#[godot_api(unsafe_threaded)]` or method-level `#[func(unsafe_threaded)]` selection; the global feature does not replace that contract.
+//!   explicit `#[class(unsafe_threaded)]`, `unsafe impl godot::obj::ThreadedGodotClass`, and interface-wide
+//!   `#[godot_api(unsafe_threaded)]`; the global feature does not replace that contract.
 //!   The remaining safety aspects of the global mode are not ironed out yet; there is a high risk of unsoundness at the moment.
 //!   As this evolves, it is very likely that the API becomes stricter.<br><br>
 //!

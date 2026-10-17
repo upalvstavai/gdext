@@ -106,9 +106,9 @@
 //! The Cargo feature `experimental-threads` provides experimental support for multithreading. The underlying safety
 //! rules are still being worked out, as such you may encounter unsoundness and an unstable API.
 //!
-//! When Godot itself dispatches selected extension-interface virtual methods on worker threads, prefer the explicit callback-scoped contract
-//! documented by [`ThreadedGodotClass`](crate::obj::ThreadedGodotClass). It keeps unselected callbacks under their ordinary main-thread
-//! contract instead of enabling the process-wide experimental mode.
+//! When Godot itself dispatches extension-interface virtual methods on worker threads, prefer the explicit callback-scoped contract documented
+//! by [`ThreadedGodotClass`](crate::obj::ThreadedGodotClass). It keeps callbacks outside the opted-in interface under their ordinary
+//! main-thread contract instead of enabling the process-wide experimental mode.
 //!
 //!
 //! ## Builtin API Design

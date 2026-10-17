@@ -677,17 +677,15 @@ use crate::util::{KvParser, bail, ident};
 ///
 /// 1. `#[class(unsafe_threaded)]` selects blocking, cross-thread lifetime storage for that class.
 /// 2. An `unsafe impl` of [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html) accepts the complete safety contract.
-/// 3. Either `#[godot_api(unsafe_threaded)]` admits every regular virtual callback in one interface implementation, or
-///    `#[func(unsafe_threaded)]` admits one selected regular virtual in an ordinary `#[godot_api]` interface implementation.
+/// 3. `#[godot_api(unsafe_threaded)]` admits every regular virtual callback in one interface implementation.
 ///
 /// This is callback-scoped. It does not permit arbitrary Rust threads to use this class or the Godot API, and it does not make `Gd`, `Base`,
-/// engine objects, or the scene tree thread-safe. Constructors and registration, `to_string`, notifications, property hooks, inherent
-/// `#[func]` methods, and unselected interface virtuals remain ordinary callbacks. Such ordinary callbacks may use `Base` under their normal
-/// main-thread contract; direct worker dispatch to an ordinary runtime callback is rejected before marshalling, instance access, or user
-/// code. This is fail-stop: the generated `extern "C"` trampoline panics before it can produce an ABI return value, so the process may
-/// terminate rather than report a recoverable operation error. Synchronous same-thread re-entry from a selected virtual is covered by that
-/// virtual's unsafe contract. `#[func(unsafe_threaded)]` is accepted only on a regular engine virtual and cannot be combined with
-/// `#[func(gd_self)]`; an interface-wide opt-in likewise does not support virtuals using `#[func(gd_self)]`.
+/// engine objects, or the scene tree thread-safe. Constructors and registration, `to_string`, notifications, property hooks, and inherent
+/// `#[func]` methods remain ordinary callbacks. Such ordinary callbacks may use `Base` under their normal main-thread contract; direct worker
+/// dispatch to an ordinary runtime callback is rejected before marshalling, instance access, or user code. This is fail-stop: the generated
+/// `extern "C"` trampoline panics before it can produce an ABI return value, so the process may terminate rather than report a recoverable
+/// operation error. Synchronous same-thread re-entry from an opted-in virtual is covered by the interface's unsafe contract. An opted-in
+/// interface does not support virtuals using `#[func(gd_self)]`.
 ///
 /// Every non-`Base<T>` field must implement `Send`. The recognized `Base<T>` field is exempt only because its embedded `Gd` is never dropped
 /// and the framework destroys its remaining bookkeeping after storage quiesces; the exemption does not permit worker-thread access to that
@@ -759,15 +757,12 @@ use crate::util::{KvParser, bail, ident};
 /// }
 /// ```
 ///
-/// Prefer the interface-level form unless every supported Godot version documents a stable per-method threading contract for that interface.
-/// A single engine operation can invoke several virtuals on its worker, and that call graph can differ by engine version and code path. The
-/// method-level form is an advanced opt-in: the implementor must identify, select, and test the complete worker callback set for every
-/// supported version. If an unselected virtual is dispatched from a worker, its ordinary callback rejects the call fail-stop.
-/// `ResourceFormatLoader` should use the interface-level form because a threaded load performs loader recognition before calling `load`.
+/// The interface-wide form is deliberate. A single engine operation can invoke several virtuals on its worker, and that call graph can differ
+/// by engine version and code path. For example, a threaded `ResourceFormatLoader` load performs loader recognition before calling `load`.
 ///
 /// `lazy-function-tables` is incompatible with this opt-in and causes a compile-time error. Enabling the global `experimental-threads` feature
-/// does not replace the class attribute, unsafe trait implementation, or callback selection. Prefer the default storage unless Godot itself
-/// invokes the selected extension virtuals off the main thread. This API is experimental and may change as Godot exposes more precise
+/// does not replace the class attribute, unsafe trait implementation, or interface opt-in. Prefer the default storage unless Godot itself
+/// invokes the extension interface virtuals off the main thread. This API is experimental and may change as Godot exposes more precise
 /// thread-safety metadata.
 ///
 /// The class attribute requires an explicit unsafe contract implementation:
@@ -935,24 +930,17 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// # Experimental worker-thread interface virtuals
 ///
 /// `#[godot_api(unsafe_threaded)]` is accepted only on an engine interface trait implementation. It admits every regular virtual trampoline in
-/// that implementation for calls from Godot worker threads. For a narrower boundary, use an ordinary `#[godot_api]` implementation and put
-/// `#[func(unsafe_threaded)]` on each selected regular virtual. Unmarked virtuals remain ordinary callbacks and may use `Base` under their
-/// normal main-thread contract.
+/// that implementation for calls from Godot worker threads. The complete interface is selected deliberately: one engine operation may call
+/// several virtuals from the same worker, and the exact call graph may change between Godot versions. For example, a threaded resource load
+/// may perform loader recognition before calling `load`.
 ///
-/// The method-level form is an advanced opt-in. Use it only where every supported Godot version documents a stable per-method threading
-/// contract, and test every engine path which can call the interface. One operation may call several virtuals from the same worker; an
-/// unselected worker callback is rejected fail-stop rather than being made safe automatically. Prefer interface-wide selection for
-/// `ResourceFormatLoader`, whose threaded load path performs loader recognition before calling `load`.
-///
-/// Neither callback-selection form admits constructors or registration, `to_string`, notifications, property hooks, or exported inherent
-/// `#[func]` callbacks. The method-level marker is rejected on those special callbacks, and it cannot be combined with `#[func(gd_self)]`;
-/// interface-wide selection likewise does not support a regular virtual using `#[func(gd_self)]`. Direct worker dispatch to an ordinary
-/// runtime callback is rejected before marshalling, instance access, or user code; only synchronous same-thread re-entry from a selected
-/// virtual is admitted under that selected virtual's unsafe contract. Registration remains part of Godot's serialized main-thread extension
-/// lifecycle.
+/// The opt-in does not admit constructors or registration, `to_string`, notifications, property hooks, or exported inherent `#[func]`
+/// callbacks, and it does not support a regular virtual using `#[func(gd_self)]`. Direct worker dispatch to an ordinary runtime callback is
+/// rejected before marshalling, instance access, or user code; only synchronous same-thread re-entry from an opted-in virtual is admitted
+/// under the interface's unsafe contract. Registration remains part of Godot's serialized main-thread extension lifecycle.
 ///
 /// Callback selection is only one part of the opt-in: the class also needs `#[class(unsafe_threaded)]` and an explicit unsafe implementation
-/// of [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html). The unsafe contract covers each selected callback's complete generated ABI,
+/// of [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html). The unsafe contract covers each regular callback's complete generated ABI,
 /// including argument and return-value marshalling, value destruction, synchronous re-entry, and extension teardown. See
 /// [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html) for the requirements and [`GodotClass`] for a complete three-part example.
 /// The global `experimental-threads` feature does not replace these opt-ins, and `lazy-function-tables` is incompatible with them.
@@ -973,41 +961,7 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
-/// A method-level opt-in without the class-level storage opt-in is rejected:
-///
-/// ```compile_fail
-/// # use godot::prelude::*;
-/// #[derive(GodotClass)]
-/// #[class(init, base = Node)]
-/// struct MissingClassOptIn;
-///
-/// unsafe impl godot::obj::ThreadedGodotClass for MissingClassOptIn {}
-///
-/// #[godot_api]
-/// impl INode for MissingClassOptIn {
-///     #[func(unsafe_threaded)]
-///     fn process(&mut self, _delta: f64) {}
-/// }
-/// ```
-///
-/// Special callbacks cannot be selected individually:
-///
-/// ```compile_fail
-/// # use godot::prelude::*;
-/// #[derive(GodotClass)]
-/// #[class(init, base = Node, unsafe_threaded)]
-/// struct InvalidSpecialCallback;
-///
-/// unsafe impl godot::obj::ThreadedGodotClass for InvalidSpecialCallback {}
-///
-/// #[godot_api]
-/// impl INode for InvalidSpecialCallback {
-///     #[func(unsafe_threaded)]
-///     fn on_notification(&mut self, _what: ObjectNotification) {}
-/// }
-/// ```
-///
-/// A selected virtual also cannot use a `Gd<Self>` receiver:
+/// An opted-in virtual also cannot use a `Gd<Self>` receiver:
 ///
 /// ```compile_fail
 /// # use godot::prelude::*;
@@ -1017,9 +971,9 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 ///
 /// unsafe impl godot::obj::ThreadedGodotClass for InvalidGdSelf {}
 ///
-/// #[godot_api]
+/// #[godot_api(unsafe_threaded)]
 /// impl INode for InvalidGdSelf {
-///     #[func(unsafe_threaded, gd_self)]
+///     #[func(gd_self)]
 ///     fn ready(_this: Gd<Self>) {}
 /// }
 /// ```

@@ -87,33 +87,30 @@ pub enum ClassThreading {
     Blocking,
 }
 
-/// Explicit safety contract for a [`GodotClass`] whose selected interface virtuals Godot may call from worker threads.
+/// Explicit safety contract for a [`GodotClass`] whose interface virtuals Godot may call from worker threads.
 ///
-/// This trait is required together with `#[class(unsafe_threaded)]`. Each worker-capable regular virtual must additionally be selected either
-/// by putting `#[godot_api(unsafe_threaded)]` on its whole interface implementation or by putting `#[func(unsafe_threaded)]` on that method in
-/// an ordinary `#[godot_api]` interface implementation. The derive macro verifies that every field other than the recognized [`Base`] field
-/// is `Send`; the implementor must uphold the parts Rust cannot verify.
+/// This trait is required together with `#[class(unsafe_threaded)]` and `#[godot_api(unsafe_threaded)]` on the complete engine interface
+/// implementation. The derive macro verifies that every field other than the recognized [`Base`] field is `Send`; the implementor must
+/// uphold the parts Rust cannot verify.
 ///
-/// The opt-in is limited to the dynamic extent of the selected Godot-to-Rust virtual callbacks. The interface-level form selects every
-/// regular virtual in that implementation; the method-level form selects only the methods carrying `#[func(unsafe_threaded)]`. Unselected
-/// methods remain ordinary callbacks and may use [`Base`] under their normal main-thread contract. Constructors and registration,
-/// `to_string`, notifications, property hooks, and inherent `#[func]` methods cannot be selected. A selected virtual cannot use
-/// `#[func(gd_self)]` or otherwise take a `Gd<Self>` receiver. None of these opt-ins authorizes arbitrary Rust threads to use the class or the
-/// Godot API. The global `experimental-threads` feature does not replace any of the three explicit opt-ins, and `lazy-function-tables` is
-/// incompatible with `#[class(unsafe_threaded)]`.
+/// The opt-in is limited to the dynamic extent of the Godot-to-Rust regular virtual callbacks in that interface implementation. Constructors
+/// and registration, `to_string`, notifications, property hooks, and inherent `#[func]` methods remain ordinary callbacks and may use
+/// [`Base`] under their normal main-thread contract. An opted-in interface cannot contain a virtual using `#[func(gd_self)]` or otherwise
+/// taking a `Gd<Self>` receiver. None of these opt-ins authorizes arbitrary Rust threads to use the class or the Godot API. The global
+/// `experimental-threads` feature does not replace any of the three explicit opt-ins, and `lazy-function-tables` is incompatible with
+/// `#[class(unsafe_threaded)]`.
 ///
 /// A direct worker-thread dispatch to any ordinary runtime callback above is rejected before argument marshalling, instance access, or user
 /// code. Rejection is fail-stop: the generated `extern "C"` trampoline panics before it can produce an ABI return value, so the process may
 /// terminate rather than report a recoverable operation error. Registration remains part of Godot's serialized main-thread extension
 /// lifecycle.
 /// An ordinary callback may run on a worker only as synchronous same-thread re-entry from the dynamic scope of a selected virtual; that
-/// complete reentrant path is then part of the selected virtual's unsafe contract.
+/// complete reentrant path is then part of the interface's unsafe contract.
 ///
-/// Prefer the interface-level form unless every supported Godot version documents a stable per-method threading contract for that interface.
-/// One engine operation may call several virtuals on the same worker (for example, a resource load can identify a loader before calling its
-/// `load` virtual), and that call graph may change between engine versions. If Godot dispatches an unselected virtual from a worker, the
-/// ordinary callback rejects the call fail-stop; the operation does not silently become safe. The method-level form is therefore an advanced
-/// opt-in whose complete worker callback set the implementor must establish and test for every supported engine version and code path.
+/// The whole regular interface is selected deliberately: one engine operation may call several virtuals on the same worker (for example, a
+/// resource load can identify a loader before calling its `load` virtual), and that call graph may change between engine versions. The unsafe
+/// contract therefore covers every regular virtual in the implementation, including virtuals which the current engine happens to call only
+/// on the main thread.
 ///
 /// Blocking storage grants one OS thread access to an instance at a time: while that thread holds any borrow, every borrow from another thread
 /// waits, including shared/shared access. Reentrant shared borrows on the same thread are allowed; a conflicting mutable re-entry fails. There
@@ -126,7 +123,7 @@ pub enum ClassThreading {
 ///
 /// # Safety
 ///
-/// For every selected regular virtual, the implementation must:
+/// For every regular virtual in the opted-in interface, the implementation must:
 ///
 /// - ensure that the complete callback ABI is valid in that thread context. This includes generated argument and return-value marshalling,
 ///   custom `FromGodot`/`ToGodot`/`GodotConvert` code, and constructing, cloning, and dropping all values involved;
@@ -156,9 +153,8 @@ pub enum ClassThreading {
 ///   object during a worker, reference, or unreference callback, that callback may run `Drop`. Worker FFI permission is revoked before the
 ///   final claim drops, so `Drop` and field destructors must not access the base object, operate on Godot objects, or call Godot APIs.
 ///
-/// With interface-wide `#[godot_api(unsafe_threaded)]`, this contract applies to every regular virtual in that implementation, including
-/// virtuals which the current Godot version happens to invoke only on the main thread. With method-level `#[func(unsafe_threaded)]`, it applies
-/// only to the explicitly marked virtual callbacks.
+/// This contract applies to every regular virtual in the `#[godot_api(unsafe_threaded)]` implementation, including virtuals which the current
+/// Godot version happens to invoke only on the main thread.
 pub unsafe trait ThreadedGodotClass: GodotClass {}
 
 impl ClassThreading {

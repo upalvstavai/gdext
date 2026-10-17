@@ -972,7 +972,7 @@ pub fn get_class_extra_docs(class_name: &TyName) -> Option<&'static str> {
             `#[class(unsafe_threaded)]`, an `unsafe impl` of \
             [`ThreadedGodotClass`](crate::obj::ThreadedGodotClass), and `#[godot_api(unsafe_threaded)]` on the complete \
             `IResourceFormatLoader` implementation. A threaded load can call several loader virtuals while selecting and loading a resource, \
-            and that set may vary with the engine version and code path, so method-level selection is not recommended for this interface. \
+            and that set may vary with the engine version and code path, so the complete interface opt-in is required. \
             The opt-in does not make arbitrary Godot APIs thread-safe. The global `experimental-threads` feature does not replace these \
             opt-ins. See \
             [`ThreadedGodotClass`](crate::obj::ThreadedGodotClass) for the complete safety contract."

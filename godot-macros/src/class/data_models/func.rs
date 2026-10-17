@@ -87,9 +87,9 @@ pub fn make_virtual_callback(
 
     let callback_invocation = if unsafe_threaded {
         quote! {
-            // SAFETY: this callback was selected by interface-wide `#[godot_api(unsafe_threaded)]` or method-level
-            // `#[func(unsafe_threaded)]`. Together with the class's explicit `unsafe impl ThreadedGodotClass`, that promises the
-            // callback and its generated marshalling use only operations valid in this Godot thread context.
+            // SAFETY: this callback was selected by interface-wide `#[godot_api(unsafe_threaded)]`. Together with the class's explicit
+            // `unsafe impl ThreadedGodotClass`, that promises the callback and its generated marshalling use only operations valid in this
+            // Godot thread context.
             unsafe { sys::with_threaded_callback_scope(__gdext_threaded_token, || #invocation) }
         }
     } else {
