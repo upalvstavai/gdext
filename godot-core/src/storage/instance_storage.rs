@@ -14,7 +14,7 @@ use godot_cell::{blocking, panicking};
 use godot_ffi as sys;
 
 use crate::godot_error;
-use crate::obj::{Base, ClassThreading, Gd, GodotClass, Inherits, Singleton};
+use crate::obj::{Base, ClassThreading, Gd, GodotClass, Inherits};
 use crate::storage::instance_registry::{self, InstanceHandle};
 use crate::storage::log_pre_drop;
 
@@ -951,7 +951,19 @@ where
     );
 }
 
-/// Reports that the storage is destroyed while the Rust object is still borrowed. May crash the process, depending on safeguard level.
+fn destruction_while_bound_message(
+    instance_id: crate::obj::InstanceId,
+    rust_type: &'static str,
+) -> String {
+    format!(
+        "Godot object destroyed during active bind() or bind_mut() guard; \
+        Gd {{ id: {instance_id}, Rust type: {rust_type} }}.\n  \
+        This is a bug in your code that may cause UB and logic errors. Make sure that objects are not\n  \
+        destroyed while you still hold a Rust reference to them, or use Gd::free() which is safe."
+    )
+}
+
+/// Reports that the storage is destroyed while the Rust object is still borrowed. May abort the process, depending on safeguard level.
 fn report_destruction_while_bound<T, S>(storage: &S)
 where
     T: GodotClass,
@@ -961,8 +973,7 @@ where
     // We have the following options:
     // 1. Print an error as a best-effort, knowing that UB is likely to occur whenever the user will access &T or &mut T. (Technically, the
     //    mere existence of these references is UB since the T is dead.)
-    // 2. Abort the process. This is the safest option, but a very drastic measure, and not what gdext does elsewhere.
-    //    We can use Godot's OS.crash() API here.
+    // 2. Abort the process. This is the safest option, but a very drastic measure.
     // 3. Change everything to "C-unwind" API. Would make the FFI unwinding safe, but still not clear if Godot would handle it appropriately.
     //    Even if yes, it's likely the same behavior as OS.crash().
     // 4. Prevent destruction of the Rust part (the concrete instance storage). This would solve the immediate problem of &T and &mut T
@@ -973,20 +984,20 @@ where
     //      still can't control direct access to the T.
     //
     // For now we choose option 2 in strict+balanced levels, and 4 in disengaged level.
-    let error = format!(
-        "Godot object destroyed during active bind() or bind_mut() guard; {:?}.\n  \
-        This is a bug in your code that may cause UB and logic errors. Make sure that objects are not\n  \
-        destroyed while you still hold a Rust reference to them, or use Gd::free() which is safe.",
-        storage.base()
+    // This path can run when a blocking storage's last claim is released on a worker thread. `Base<T>`'s Debug implementation queries dynamic
+    // Godot object state, and `OS.crash()` is an object API, so neither is valid here. The instance ID is cached in `RawGd`, `type_name` is
+    // static Rust metadata, and `godot_error!` uses the reviewed thread-safe error-printing interface.
+    let error = destruction_while_bound_message(
+        storage.base().instance_id_unchecked(),
+        std::any::type_name::<T>(),
     );
 
-    // In strict+balanced level, crash which may trigger breakpoint.
+    godot_error!("{}", error);
+
+    // In strict+balanced level, abort without going back through a main-thread-only Godot object API.
     // In disengaged level, leak Rust object (Godot philosophy: don't crash if somehow avoidable). Likely leads to follow-up issues.
     if cfg!(safeguards_balanced) {
-        let error = crate::builtin::GString::from(&error);
-        crate::classes::Os::singleton().crash(&error);
-    } else {
-        godot_error!("{}", error);
+        std::process::abort();
     }
 }
 
@@ -1052,10 +1063,11 @@ mod claim_tests {
 
     use super::{
         AtomicClaimState, AtomicClaimWord, BlockingInstanceStorage, CLAIMS_COUNT_MASK,
-        InstanceStorage, LocalClaimState, StorageClaim, direct_storage_ptr,
-        release_godot_claim_ordered,
+        InstanceStorage, LocalClaimState, StorageClaim, destruction_while_bound_message,
+        direct_storage_ptr, release_godot_claim_ordered,
     };
     use crate::classes::Object;
+    use crate::obj::InstanceId;
 
     #[cfg(not(target_family = "wasm"))]
     impl AtomicClaimWord for loom::sync::atomic::AtomicU32 {
@@ -1125,6 +1137,34 @@ mod claim_tests {
 
         assert!(!alive.load(Ordering::SeqCst));
         assert_eq!(deallocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn destruction_while_bound_diagnostic_uses_cached_identity_only() {
+        let message = destruction_while_bound_message(
+            InstanceId::from_i64(42),
+            "example::ExplicitThreadedClass",
+        );
+
+        assert!(message.contains("id: 42"));
+        assert!(message.contains("Rust type: example::ExplicitThreadedClass"));
+
+        // This defensive path can run on a worker. Keep it independent of Base<T>'s dynamic Debug implementation and main-thread-only
+        // singleton calls; the production function may only extract Base's cached instance ID.
+        let source = include_str!("instance_storage.rs");
+        let start = source
+            .find("fn report_destruction_while_bound")
+            .expect("destruction reporter must exist");
+        let end = source[start..]
+            .find("// ----------------------------------------------------------------------------------------------------------------------------------------------")
+            .map(|offset| start + offset)
+            .expect("destruction reporter section terminator must exist");
+        let reporter = &source[start..end];
+
+        assert!(!reporter.contains("{:?}"));
+        assert!(!reporter.contains("Os::singleton"));
+        assert!(reporter.contains("instance_id_unchecked"));
+        assert!(reporter.contains("std::process::abort"));
     }
 
     #[test]

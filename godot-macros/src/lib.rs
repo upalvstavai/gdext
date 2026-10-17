@@ -686,11 +686,29 @@ use crate::util::{KvParser, bail, ident};
 /// main-thread contract. `#[func(unsafe_threaded)]` is accepted only on a regular engine virtual and cannot be combined with
 /// `#[func(gd_self)]`; an interface-wide opt-in likewise does not support virtuals using `#[func(gd_self)]`.
 ///
-/// Every non-`Base<T>` field must implement `Send`. Access to one instance moves between OS threads serially: while one thread holds any
-/// borrow, another thread waits even for a shared borrow. Do not wait for an operation that can dispatch another callback to the same instance
-/// while holding its receiver or a bind guard. The unsafe contract also covers generated argument/return-value marshalling, synchronous
-/// re-entry, destruction on the thread releasing the last storage claim, and quiescing callback dispatch before extension unload. See the
-/// safety documentation on [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html) before opting in.
+/// Every non-`Base<T>` field must implement `Send`. The recognized `Base<T>` field is exempt only because its embedded `Gd` is never dropped
+/// and the framework destroys its remaining bookkeeping after storage quiesces; the exemption does not permit worker-thread access to that
+/// field. Access to one instance moves between OS threads serially: while one thread holds any borrow, another thread waits even for a shared
+/// borrow. Do not wait for an operation that can dispatch another callback to the same instance while holding its receiver or a bind guard.
+/// The unsafe contract also covers generated argument/return-value marshalling, synchronous re-entry, destruction on the thread releasing the
+/// last storage claim, and quiescing callback dispatch before extension unload. See the safety documentation on
+/// [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html) before opting in.
+///
+/// A non-`Base<T>` field which is not `Send` is rejected even when the unsafe trait is implemented:
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// use godot::prelude::*;
+///
+/// #[derive(GodotClass)]
+/// #[class(init, unsafe_threaded)]
+/// struct InvalidThreadedClass {
+///     local_only: Rc<u64>,
+/// }
+///
+/// unsafe impl godot::obj::ThreadedGodotClass for InvalidThreadedClass {}
+/// ```
 ///
 /// ```no_run
 /// use std::sync::Mutex;

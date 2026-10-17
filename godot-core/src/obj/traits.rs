@@ -112,6 +112,11 @@ pub enum ClassThreading {
 /// waits, including shared/shared access. Reentrant shared borrows on the same thread are allowed; a conflicting mutable re-entry fails. There
 /// is no timeout or deadlock detection.
 ///
+/// The recognized [`Base`] field is deliberately excluded from the generated `Send` checks. Its embedded `Gd` is held in `ManuallyDrop`, so
+/// destroying storage never performs a Godot reference-count operation, and its framework-owned initialization tracker is destroyed only
+/// after storage has quiesced. This narrow representation exception does not make `Base` usable on a worker thread; accessing or moving it in
+/// a selected callback remains covered by the prohibition below.
+///
 /// # Safety
 ///
 /// For every selected regular virtual, the implementation must:
