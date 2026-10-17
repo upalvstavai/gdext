@@ -301,22 +301,24 @@ fn threaded_format_loader_worker_callbacks() {
         state.lifetime_callback_entered.load(Ordering::SeqCst)
     });
 
-    // Unregister while `load` is active, but retain the caller's strong reference until the callback
-    // and load token are drained. Godot 4.7 does not keep a lifetime-safe engine reference here:
-    // dropping this final `Gd` in the active callback produces the engine-use-after-free diagnostic.
-    registration.unregister();
-    let unregistered_while_active = state.active_loads.load(Ordering::SeqCst) == 1;
+    // Keep both Godot's registration and the caller's strong reference alive until the callback
+    // and load token are drained. Godot 4.7 does not keep an independent lifetime-safe reference
+    // after unregistering: dropping the final `Gd` during this callback produces its
+    // engine-use-after-free diagnostic. Unregistering concurrently with loader selection is also
+    // an engine-level synchronization question, so this test deliberately avoids relying on it.
+    let retained_while_active = state.active_loads.load(Ordering::SeqCst) == 1;
     state.release_lifetime_callback();
     drop(wait_for_threaded_load(
         &mut registration.loader,
         LIFETIME_PATH,
     ));
+    registration.unregister();
     registration.drop_format_loader();
 
     let lifetime_callback_timed_out = state.lifetime_callback_timed_out.load(Ordering::SeqCst);
     assert!(
-        unregistered_while_active,
-        "Godot did not return from unregistering the loader while its callback was active"
+        retained_while_active,
+        "the owner did not retain the loader while its lifetime callback was active"
     );
     assert!(
         !lifetime_callback_timed_out,
