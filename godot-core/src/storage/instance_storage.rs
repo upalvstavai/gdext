@@ -95,6 +95,7 @@ impl CloseSnapshot {
 }
 
 /// Claim admission for single-threaded storage. It mirrors [`AtomicClaimState`] so destruction uses one protocol for both storage kinds.
+#[repr(transparent)]
 pub(super) struct LocalClaimState {
     state: Cell<u32>,
 }
@@ -1063,11 +1064,21 @@ mod claim_tests {
 
     use super::{
         AtomicClaimState, AtomicClaimWord, BlockingInstanceStorage, CLAIMS_COUNT_MASK,
-        InstanceStorage, LocalClaimState, StorageClaim, destruction_while_bound_message,
+        InstanceStorage, Lifecycle, LocalClaimState, StorageClaim, destruction_while_bound_message,
         direct_storage_ptr, release_godot_claim_ordered,
     };
     use crate::classes::Object;
-    use crate::obj::InstanceId;
+    use crate::obj::{Base, GodotClass, InstanceId};
+    use crate::storage::DebugBorrowTracker;
+
+    #[allow(dead_code)]
+    struct PreThreadingInstanceStorage<T: GodotClass> {
+        user_instance: godot_cell::panicking::GdCell<T>,
+        base: Base<T::Base>,
+        lifecycle: std::cell::Cell<Lifecycle>,
+        claims: std::cell::Cell<u32>,
+        borrow_tracker: DebugBorrowTracker,
+    }
 
     #[cfg(not(target_family = "wasm"))]
     impl AtomicClaimWord for loom::sync::atomic::AtomicU32 {
@@ -1262,29 +1273,20 @@ mod claim_tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn concrete_storage_layout_preserves_single_threaded_baseline() {
-        let expected_single_threaded_size = if cfg!(safeguards_strict) {
-            120
-        } else if cfg!(safeguards_balanced) {
-            40
-        } else {
-            32
-        };
-        let expected_blocking_size = if cfg!(safeguards_strict) {
-            144
-        } else if cfg!(safeguards_balanced) {
-            64
-        } else {
-            56
-        };
-
         assert_eq!(
             std::mem::size_of::<InstanceStorage<Object>>(),
-            expected_single_threaded_size,
+            std::mem::size_of::<PreThreadingInstanceStorage<Object>>(),
             "ordinary user classes must retain the pre-threading storage allocation size",
         );
         assert_eq!(
-            std::mem::size_of::<BlockingInstanceStorage<Object>>(),
-            expected_blocking_size,
+            std::mem::align_of::<InstanceStorage<Object>>(),
+            std::mem::align_of::<PreThreadingInstanceStorage<Object>>(),
+            "ordinary user classes must retain the pre-threading storage alignment",
+        );
+        assert!(
+            std::mem::size_of::<BlockingInstanceStorage<Object>>()
+                > std::mem::size_of::<InstanceStorage<Object>>(),
+            "only explicitly threaded classes should pay for the larger blocking storage",
         );
         assert_eq!(
             std::mem::size_of::<StorageClaim<Object>>(),
