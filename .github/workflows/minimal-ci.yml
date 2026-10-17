@@ -127,8 +127,16 @@ jobs:
       - name: "Test"
         run: cargo test $TEST_FEATURES
 
-      - name: "Model-check threaded callback admission"
-        run: RUSTFLAGS="--cfg loom" cargo test -p godot-ffi --lib loom_threaded_callback_admission_tests
+      - name: "Model-check threaded callback claims and admission"
+        run: |
+          RUSTFLAGS="--cfg loom" cargo test -p godot-ffi --lib loom_threaded_callback_admission_tests
+          cargo test -p godot-core --lib loom_
+
+      - name: "Test threaded callback storage configurations"
+        run: |
+          cargo test -p godot-core -p godot-ffi --lib --features experimental-threads
+          cargo test -p godot-core --lib --features safeguards-dev-balanced concrete_storage_layout_preserves_single_threaded_baseline
+          cargo test -p godot-core --lib --release --features safeguards-release-disengaged concrete_storage_layout_preserves_single_threaded_baseline
 
       - name: "Run doctest in minimal feature set"
         run: cargo test --doc --no-default-features
@@ -257,7 +265,7 @@ jobs:
             godot-binary: godot.linuxbsd.editor.dev.x86_64.llvm.san
             rust-toolchain: nightly
             rust-env-rustflags: -Zrandomize-layout -Zsanitizer=address
-            rust-extra-args: --features godot/api-custom
+            rust-extra-args: --features godot/api-custom,itest/threaded-callbacks
             # Sanitizers can't build proc-macros and build scripts; with --target, cargo ignores RUSTFLAGS for those two.
             rust-target: x86_64-unknown-linux-gnu
             run-editor-itest: 'false' # editor has memory leaks; https://github.com/godot-rust/gdext/pull/1591.
@@ -317,6 +325,7 @@ jobs:
       - doc-lints
       - clippy
       - unit-test
+      - unit-test-web
       - godot-itest
       - license-guard
 

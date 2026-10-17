@@ -172,9 +172,18 @@ jobs:
       - name: "Test"
         run: cargo test $TEST_FEATURES ${{ matrix.rust-extra-args }}
 
-      - name: "Model-check threaded callback admission"
+      - name: "Model-check threaded callback claims and admission"
         if: matrix.name == 'linux' && matrix.rust-special == ''
-        run: RUSTFLAGS="--cfg loom" cargo test -p godot-ffi --lib loom_threaded_callback_admission_tests
+        run: |
+          RUSTFLAGS="--cfg loom" cargo test -p godot-ffi --lib loom_threaded_callback_admission_tests
+          cargo test -p godot-core --lib loom_
+
+      - name: "Test threaded callback storage configurations"
+        if: matrix.name == 'linux' && matrix.rust-special == ''
+        run: |
+          cargo test -p godot-core -p godot-ffi --lib --features experimental-threads
+          cargo test -p godot-core --lib --features safeguards-dev-balanced concrete_storage_layout_preserves_single_threaded_baseline
+          cargo test -p godot-core --lib --release --features safeguards-release-disengaged concrete_storage_layout_preserves_single_threaded_baseline
 
   unit-test-web:
     name: unit-test-web (${{ matrix.name }})
@@ -351,7 +360,7 @@ jobs:
             godot-binary: godot.linuxbsd.editor.dev.x86_64
             # Important to keep both experimental-threads and codegen-full. Some itests (native_st_audio) require both.
             # Also the only entry exercising the variant FFI-marshal fallback at runtime; the Rust-marshal default is covered everywhere else.
-            rust-extra-args: --features itest/experimental-threads,itest/codegen-full-experimental,itest/upcoming-editor-placeholders,godot/api-custom,godot/serde,itest/register-docs,godot/__variant-ffi-marshal
+            rust-extra-args: --features itest/experimental-threads,itest/codegen-full-experimental,itest/upcoming-editor-placeholders,godot/api-custom,godot/serde,itest/register-docs,godot/__variant-ffi-marshal,itest/threaded-callbacks
 
           # Compiles godot-rust with `api-custom-json` feature against the JSON file generated via `--dump-extension-api`.
           # Uses latest 4.x headers, while `extension_api.json` comes from the latest Godot binary.
@@ -368,7 +377,7 @@ jobs:
             godot-binary: godot.linuxbsd.template_release.x86_64
             # Use `codegen-full-experimental` to make sure that all function tables can be loaded in Godot release builds.
             # If the experimental part causes problems, downgrade to `codegen-full`.
-            rust-extra-args: --release --features itest/codegen-full-experimental
+            rust-extra-args: --release --features itest/codegen-full-experimental,itest/threaded-callbacks
             rust-cache-key: release
             run-editor-itest: 'false' # template_release binary has no editor.
 
@@ -439,7 +448,7 @@ jobs:
             godot-binary: godot.linuxbsd.editor.dev.x86_64.llvm.san
             rust-toolchain: nightly
             rust-env-rustflags: -Zrandomize-layout -Zsanitizer=address
-            rust-extra-args: --features godot/api-custom
+            rust-extra-args: --features godot/api-custom,itest/threaded-callbacks
             # Sanitizers can't build proc-macros and build scripts; with --target, cargo ignores RUSTFLAGS for those two.
             rust-target: x86_64-unknown-linux-gnu
             run-editor-itest: 'false' # editor has memory leaks; https://github.com/godot-rust/gdext/pull/1591.
@@ -451,7 +460,7 @@ jobs:
             rust-toolchain: nightly
             rust-env-rustflags: -Zrandomize-layout -Zsanitizer=address
             # Currently without itest/codegen-full-experimental.
-            rust-extra-args: --release --features godot/safeguards-release-disengaged
+            rust-extra-args: --release --features godot/safeguards-release-disengaged,itest/threaded-callbacks
             rust-target: x86_64-unknown-linux-gnu
             rust-target-dir: release # We're running Godot debug build with Rust release dylib.
             run-editor-itest: 'false' # editor has memory leaks; https://github.com/godot-rust/gdext/pull/1591.
@@ -463,7 +472,7 @@ jobs:
             rust-toolchain: nightly
             rust-env-rustflags: -Zrandomize-layout -Zsanitizer=address
             # Currently without itest/codegen-full-experimental.
-            rust-extra-args: --features godot/safeguards-dev-balanced
+            rust-extra-args: --features godot/safeguards-dev-balanced,itest/threaded-callbacks
             rust-target: x86_64-unknown-linux-gnu
             run-editor-itest: 'false' # editor has memory leaks; https://github.com/godot-rust/gdext/pull/1591.
 
@@ -474,6 +483,7 @@ jobs:
             godot-binary: godot.linuxbsd.editor.dev.x86_64.llvm.san
             rust-toolchain: nightly
             rust-env-rustflags: -Zrandomize-layout -Zsanitizer=address
+            rust-extra-args: --features itest/threaded-callbacks
             # Sanitizers can't build proc-macros and build scripts; with --target, cargo ignores RUSTFLAGS for those two.
             rust-target: x86_64-unknown-linux-gnu
             run-editor-itest: 'false' # editor has memory leaks; https://github.com/godot-rust/gdext/pull/1591.
@@ -559,6 +569,7 @@ jobs:
       - doc-lints
       - clippy
       - unit-test
+      - unit-test-web
       - miri-test
       - godot-itest
       - cargo-deny-machete
