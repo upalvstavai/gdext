@@ -87,6 +87,32 @@ fn with_ordinary_class_callback<T: GodotClass, R>(callback: impl FnOnce() -> R) 
     }
 }
 
+/// Runs Godot's lazy virtual-method lookup while pinning the binding for an explicitly threaded
+/// class.
+///
+/// Godot can perform the first lookup for an opted-in virtual on the worker which is about to call
+/// it. This happens before the generated virtual trampoline can acquire its own admission lease.
+/// The lookup itself only converts the borrowed method name through reviewed thread-safe builtin
+/// operations and selects a generated function pointer; it never invokes user code. Entering the
+/// scoped permission also covers the pre-4.3 tool-class compatibility check, which reads immutable
+/// binding configuration.
+#[inline(always)]
+fn with_virtual_lookup_callback<T: GodotClass, R>(callback: impl FnOnce() -> R) -> R {
+    if T::__UNSAFE_THREADED_OPT_IN {
+        // SAFETY: this is the complete lazy-lookup callback. Explicit threaded opt-in permits the
+        // worker which will run the selected virtual to resolve its trampoline first. All work in
+        // this scope is framework-controlled and limited to thread-safe name conversion, immutable
+        // configuration lookup, and static function-pointer selection.
+        unsafe {
+            sys::with_threaded_callback_admission(|token| {
+                sys::with_threaded_callback_scope(token, callback)
+            })
+        }
+    } else {
+        callback()
+    }
+}
+
 /// Godot FFI default constructor.
 ///
 /// If the `init()` constructor panics, null is returned.
@@ -297,13 +323,13 @@ pub unsafe extern "C" fn get_virtual<T: cap::ImplementsGodotVirtual>(
     name: sys::GDExtensionConstStringNamePtr,
     hash: u32,
 ) -> sys::GDExtensionClassCallVirtual {
-    unsafe {
+    with_virtual_lookup_callback::<T, _>(|| unsafe {
         // This string is not ours, so we cannot call the destructor on it.
         let borrowed_string = StringName::borrow_string_sys(name);
         let method_name = borrowed_string.to_string();
 
         T::__virtual_call(method_name.as_str(), hash)
-    }
+    })
 }
 
 #[cfg(before_api = "4.4")]
@@ -311,38 +337,42 @@ pub unsafe extern "C" fn get_virtual<T: cap::ImplementsGodotVirtual>(
     _class_user_data: *mut std::ffi::c_void,
     name: sys::GDExtensionConstStringNamePtr,
 ) -> sys::GDExtensionClassCallVirtual {
-    // This string is not ours, so we cannot call the destructor on it.
-    let borrowed_string = StringName::borrow_string_sys(name);
-    let method_name = borrowed_string.to_string();
+    with_virtual_lookup_callback::<T, _>(|| {
+        // This string is not ours, so we cannot call the destructor on it.
+        let borrowed_string = unsafe { StringName::borrow_string_sys(name) };
+        let method_name = borrowed_string.to_string();
 
-    T::__virtual_call(method_name.as_str())
+        T::__virtual_call(method_name.as_str())
+    })
 }
 
 #[cfg(since_api = "4.4")]
-pub unsafe extern "C" fn default_get_virtual<T: UserClass>(
+pub unsafe extern "C" fn default_get_virtual<T: UserClass + GodotClass>(
     _class_user_data: *mut std::ffi::c_void,
     name: sys::GDExtensionConstStringNamePtr,
     hash: u32,
 ) -> sys::GDExtensionClassCallVirtual {
-    unsafe {
+    with_virtual_lookup_callback::<T, _>(|| unsafe {
         // This string is not ours, so we cannot call the destructor on it.
         let borrowed_string = StringName::borrow_string_sys(name);
         let method_name = borrowed_string.to_string();
 
         T::__default_virtual_call(method_name.as_str(), hash)
-    }
+    })
 }
 
 #[cfg(before_api = "4.4")]
-pub unsafe extern "C" fn default_get_virtual<T: UserClass>(
+pub unsafe extern "C" fn default_get_virtual<T: UserClass + GodotClass>(
     _class_user_data: *mut std::ffi::c_void,
     name: sys::GDExtensionConstStringNamePtr,
 ) -> sys::GDExtensionClassCallVirtual {
-    // This string is not ours, so we cannot call the destructor on it.
-    let borrowed_string = StringName::borrow_string_sys(name);
-    let method_name = borrowed_string.to_string();
+    with_virtual_lookup_callback::<T, _>(|| {
+        // This string is not ours, so we cannot call the destructor on it.
+        let borrowed_string = unsafe { StringName::borrow_string_sys(name) };
+        let method_name = borrowed_string.to_string();
 
-    T::__default_virtual_call(method_name.as_str())
+        T::__default_virtual_call(method_name.as_str())
+    })
 }
 
 #[expect(unsafe_op_in_unsafe_fn)] // Pointer validity asserted by Godot.
@@ -525,27 +555,30 @@ pub unsafe extern "C" fn free_property_list<T: cap::GodotGetPropertyList>(
     list: *const sys::GDExtensionPropertyInfo,
     count: u32,
 ) {
-    let list = list as *mut sys::GDExtensionPropertyInfo;
+    with_ordinary_class_callback::<T, _>(|| {
+        let list = list as *mut sys::GDExtensionPropertyInfo;
 
-    // SAFETY: `list` comes from `get_property_list` above, and `count` also comes from the same function.
-    // This means that `list` is a pointer to a `&[sys::GDExtensionPropertyInfo]` slice of length `count`.
-    // This means all the preconditions of this function are satisfied except uniqueness of this point.
-    // Uniqueness is guaranteed as Godot called this function at a point where the list is no longer accessed
-    // through any other pointer, and we don't access the slice through any other pointer after this call either.
-    let property_list_slice = unsafe { std::slice::from_raw_parts_mut(list, u32_to_usize(count)) };
+        // SAFETY: `list` comes from `get_property_list` above, and `count` also comes from the same function.
+        // This means that `list` is a pointer to a `&[sys::GDExtensionPropertyInfo]` slice of length `count`.
+        // This means all the preconditions of this function are satisfied except uniqueness of this point.
+        // Uniqueness is guaranteed as Godot called this function at a point where the list is no longer accessed
+        // through any other pointer, and we don't access the slice through any other pointer after this call either.
+        let property_list_slice =
+            unsafe { std::slice::from_raw_parts_mut(list, u32_to_usize(count)) };
 
-    // SAFETY: This slice was created by calling `Box::leak` on a `Box<[sys::GDExtensionPropertyInfo]>`, we can thus
-    // call `Box::from_raw` on this slice to get back the original boxed slice.
-    // Note that this relies on coercion of `&mut` -> `*mut`.
-    let property_list_sys = unsafe { Box::from_raw(property_list_slice) };
+        // SAFETY: This slice was created by calling `Box::leak` on a `Box<[sys::GDExtensionPropertyInfo]>`, we can thus
+        // call `Box::from_raw` on this slice to get back the original boxed slice.
+        // Note that this relies on coercion of `&mut` -> `*mut`.
+        let property_list_sys = unsafe { Box::from_raw(property_list_slice) };
 
-    for property_info in property_list_sys.iter() {
-        // SAFETY: The structs contained in this list were all returned from `into_owned_property_sys`.
-        // We only call this method once for each struct and for each list.
-        unsafe {
-            crate::registry::info::PropertyInfo::free_owned_property_sys(*property_info);
+        for property_info in property_list_sys.iter() {
+            // SAFETY: The structs contained in this list were all returned from `into_owned_property_sys`.
+            // We only call this method once for each struct and for each list.
+            unsafe {
+                crate::registry::info::PropertyInfo::free_owned_property_sys(*property_info);
+            }
         }
-    }
+    })
 }
 
 /// # Safety
@@ -695,6 +728,7 @@ mod tests {
             "get",
             "set",
             "get_property_list",
+            "free_property_list",
             "property_can_revert",
             "property_get_revert",
             "validate_property",
@@ -719,6 +753,29 @@ mod tests {
                 found != 0,
                 "expected callback `{name}` in the boundary inventory"
             );
+        }
+    }
+
+    #[test]
+    fn every_virtual_lookup_enters_the_lookup_boundary() {
+        let source = include_str!("callbacks.rs");
+
+        for name in ["get_virtual", "default_get_virtual"] {
+            let needle = format!("pub unsafe extern \"C\" fn {name}<");
+            let mut found = 0;
+            for (start, _) in source.match_indices(&needle) {
+                found += 1;
+                let rest = &source[start..];
+                let end = rest
+                    .find("\n}\n")
+                    .expect("callback function must have a top-level closing brace");
+                let callback = &rest[..end + 2];
+                assert!(
+                    callback.contains("with_virtual_lookup_callback::<T, _>"),
+                    "{name} must pin the binding before lazy worker-thread lookup"
+                );
+            }
+            assert!(found != 0, "expected callback `{name}` in lookup inventory");
         }
     }
 }
