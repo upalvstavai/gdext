@@ -22,7 +22,6 @@ use std::sync::{
     Condvar as CallbackCondvar, Mutex as CallbackMutex, MutexGuard as CallbackMutexGuard,
 };
 
-#[cfg(not(feature = "experimental-threads"))]
 thread_local! {
     static THREADED_CALLBACK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
@@ -196,8 +195,6 @@ pub const UNSAFE_THREADED_CALLBACKS_SUPPORTED: bool = !cfg!(feature = "codegen-l
 /// responsible for using Godot APIs that are valid in that callback's thread context. Same-thread synchronous callbacks re-entered through
 /// Godot inherit the current thread-local scope; the unsafe opt-in must cover that complete path.
 struct ThreadedCallbackGuard {
-    #[cfg(not(feature = "experimental-threads"))]
-    _private: (),
     // The permission belongs to this OS thread. Moving the guard would decrement another thread's depth on drop and leave the origin enabled.
     _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -214,7 +211,6 @@ impl ThreadedCallbackGuard {
             panic!("threaded callback scopes require eagerly initialized function tables");
         }
 
-        #[cfg(not(feature = "experimental-threads"))]
         THREADED_CALLBACK_DEPTH.with(|depth| {
             depth.set(
                 depth
@@ -225,8 +221,6 @@ impl ThreadedCallbackGuard {
         });
 
         Self {
-            #[cfg(not(feature = "experimental-threads"))]
-            _private: (),
             _not_send_sync: std::marker::PhantomData,
         }
     }
@@ -265,6 +259,35 @@ pub unsafe fn with_threaded_callback_admission<R>(
     // required even when `experimental-threads` permits general cross-thread binding access: explicit callback opt-ins still promise that
     // their complete trampoline pins the binding through teardown.
     unsafe { with_threaded_callback_admission_in(threaded_callback_admission(), callback) }
+}
+
+/// Holds the binding-lifetime admission lease across an ordinary generated callback belonging to
+/// an explicitly threaded class.
+///
+/// Ordinary classes bypass the gate entirely. An explicitly threaded class still needs the lease:
+/// blocking instance storage makes a claim possible on any thread, and deinitialization must not
+/// clear the binding while an ordinary main-thread callback or a valid synchronous re-entry is
+/// active.
+///
+/// # Safety
+/// When `explicitly_threaded_class` is true, `callback` must be the complete generated trampoline
+/// and its first operation must call [`ensure_ordinary_callback_thread`] before touching the
+/// binding, instance storage, ABI arguments, or user code.
+#[doc(hidden)]
+#[inline(always)]
+pub unsafe fn with_ordinary_callback_admission<R>(
+    explicitly_threaded_class: bool,
+    callback: impl FnOnce() -> R,
+) -> R {
+    if explicitly_threaded_class {
+        // SAFETY: forwarded from this function's contract. Ordinary callbacks do not enter the
+        // worker binding-permission scope; this admission only pins binding lifetime.
+        unsafe {
+            with_threaded_callback_admission_in(threaded_callback_admission(), |_| callback())
+        }
+    } else {
+        callback()
+    }
 }
 
 unsafe fn with_threaded_callback_admission_in<'a, R>(
@@ -308,7 +331,6 @@ pub unsafe fn with_threaded_callback_scope<R>(
 
 impl Drop for ThreadedCallbackGuard {
     fn drop(&mut self) {
-        #[cfg(not(feature = "experimental-threads"))]
         THREADED_CALLBACK_DEPTH.with(|depth| {
             let current = depth.get();
             debug_assert!(current > 0, "unbalanced threaded callback scope");
@@ -317,10 +339,187 @@ impl Drop for ThreadedCallbackGuard {
     }
 }
 
-#[cfg(not(feature = "experimental-threads"))]
-#[cfg_attr(not(safeguards_balanced), allow(dead_code))]
-pub(super) fn is_in_threaded_callback() -> bool {
+fn is_in_threaded_callback() -> bool {
     THREADED_CALLBACK_DEPTH.with(|depth| depth.get() != 0)
+}
+
+/// Rejects an ordinary generated callback for an explicitly threaded class before it can claim
+/// instance storage, unmarshal arguments, or run user code on an unapproved worker thread.
+///
+/// A synchronous ordinary callback re-entered from the dynamic scope of an already selected
+/// threaded virtual is allowed on that same OS thread. Its complete path is covered by the outer
+/// callback's unsafe contract and inherits the outer thread-local binding permission. Merely
+/// holding a binding-lifetime admission lease is not enough: after the selected invocation scope
+/// ends, ordinary callbacks return to their main-thread-only contract.
+///
+/// This boundary is deliberately independent of safeguard level. In particular, release builds
+/// with disengaged safeguards must fail before entering the callback rather than relying on a
+/// later checked Godot API access which may not exist in a primitive-only callback body.
+#[doc(hidden)]
+#[inline(always)]
+pub fn ensure_ordinary_callback_thread(explicitly_threaded_class: bool) {
+    if explicitly_threaded_class {
+        ensure_ordinary_callback_thread_in(crate::is_main_thread());
+    }
+}
+
+#[inline(always)]
+fn ensure_ordinary_callback_thread_in(is_main_thread: bool) {
+    if !is_main_thread && !is_in_threaded_callback() {
+        panic!(
+            "ordinary callback for #[class(unsafe_threaded)] started outside the main thread and outside a synchronous opted-in threaded callback"
+        );
+    }
+}
+
+#[cfg(all(test, not(loom), not(feature = "codegen-lazy-fptrs")))]
+mod ordinary_callback_thread_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{
+        ThreadedCallbackAdmission, ensure_ordinary_callback_thread_in,
+        with_threaded_callback_admission_in, with_threaded_callback_scope,
+    };
+
+    unsafe fn with_local_ordinary_admission<R>(
+        admission: &ThreadedCallbackAdmission,
+        explicitly_threaded_class: bool,
+        callback: impl FnOnce() -> R,
+    ) -> R {
+        if explicitly_threaded_class {
+            // SAFETY: test-only equivalent of the generated ordinary trampoline. Its caller
+            // places the thread gate first in `callback`.
+            unsafe { with_threaded_callback_admission_in(admission, |_| callback()) }
+        } else {
+            callback()
+        }
+    }
+
+    unsafe fn run_ordinary_primitive_callback(
+        admission: &ThreadedCallbackAdmission,
+        explicitly_threaded_class: bool,
+        is_main_thread: bool,
+        body: impl FnOnce(),
+    ) {
+        // SAFETY: the thread gate is the first operation in the complete modeled trampoline.
+        unsafe {
+            with_local_ordinary_admission(admission, explicitly_threaded_class, || {
+                if explicitly_threaded_class {
+                    ensure_ordinary_callback_thread_in(is_main_thread);
+                }
+                body();
+            })
+        }
+    }
+
+    #[test]
+    fn worker_is_rejected_before_ordinary_primitive_abi_body() {
+        let admission = Arc::new(ThreadedCallbackAdmission::default());
+        admission.open();
+        let body_calls = Arc::new(AtomicUsize::new(0));
+        let worker_admission = Arc::clone(&admission);
+        let worker_body_calls = Arc::clone(&body_calls);
+
+        let result = std::thread::spawn(move || {
+            std::panic::catch_unwind(|| {
+                // SAFETY: this models the generated trampoline and puts the gate before the body.
+                unsafe {
+                    run_ordinary_primitive_callback(&worker_admission, true, false, || {
+                        worker_body_calls.fetch_add(1, Ordering::SeqCst);
+                    });
+                }
+            })
+        })
+        .join()
+        .unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(body_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(admission.lock_state().active, 0);
+        admission.close_and_wait();
+    }
+
+    #[test]
+    fn ordinary_callback_gate_preserves_main_thread_and_unopted_classes() {
+        let admission = ThreadedCallbackAdmission::default();
+        admission.open();
+        let body_calls = AtomicUsize::new(0);
+
+        unsafe {
+            run_ordinary_primitive_callback(&admission, true, true, || {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+            });
+            run_ordinary_primitive_callback(&admission, false, false, || {
+                body_calls.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        assert_eq!(body_calls.load(Ordering::SeqCst), 2);
+        admission.close_and_wait();
+    }
+
+    #[test]
+    fn ordinary_callback_pins_binding_until_complete() {
+        let admission = ThreadedCallbackAdmission::default();
+        admission.open();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let admission_ref = &admission;
+            let callback = scope.spawn(move || unsafe {
+                run_ordinary_primitive_callback(admission_ref, true, true, || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+            });
+
+            entered_rx.recv().unwrap();
+            let close = scope.spawn(|| admission.close_and_wait());
+            admission.wait_until_closed();
+            assert!(!close.is_finished());
+
+            release_tx.send(()).unwrap();
+            callback.join().unwrap();
+            close.join().unwrap();
+        });
+
+        assert_eq!(admission.lock_state().active, 0);
+    }
+
+    #[test]
+    fn synchronous_reentry_is_allowed_only_inside_selected_callback_scope() {
+        let admission = Arc::new(ThreadedCallbackAdmission::default());
+        admission.open();
+        let body_calls = Arc::new(AtomicUsize::new(0));
+
+        let worker_admission = Arc::clone(&admission);
+        let worker_body_calls = Arc::clone(&body_calls);
+        let after_scope_result = std::thread::spawn(move || unsafe {
+            with_threaded_callback_admission_in(&worker_admission, |token| {
+                with_threaded_callback_scope(token, || {
+                    run_ordinary_primitive_callback(&worker_admission, true, false, || {
+                        worker_body_calls.fetch_add(1, Ordering::SeqCst);
+                    });
+                });
+
+                // A binding-lifetime lease by itself does not extend the unsafe permission into
+                // panic conversion or other post-invocation work.
+                std::panic::catch_unwind(|| {
+                    run_ordinary_primitive_callback(&worker_admission, true, false, || {
+                        worker_body_calls.fetch_add(1, Ordering::SeqCst);
+                    });
+                })
+            })
+        })
+        .join()
+        .unwrap();
+
+        assert!(after_scope_result.is_err());
+        assert_eq!(body_calls.load(Ordering::SeqCst), 1);
+        admission.close_and_wait();
+    }
 }
 
 #[cfg(feature = "experimental-threads")]

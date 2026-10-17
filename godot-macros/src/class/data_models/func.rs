@@ -126,7 +126,23 @@ pub fn make_virtual_callback(
             }
         }
     } else {
-        handled_callback
+        quote! {
+            // Blocking storage makes the instance claim itself safe on a worker, so an
+            // unselected callback needs an explicit thread check before the generic panic
+            // catcher and before any claim or argument unmarshalling. Keep the binding alive
+            // across the whole ordinary trampoline for explicitly threaded classes, too.
+            unsafe {
+                sys::with_ordinary_callback_admission(
+                    <#class_name as ::godot::obj::GodotClass>::__UNSAFE_THREADED_OPT_IN,
+                    || {
+                        sys::ensure_ordinary_callback_thread(
+                            <#class_name as ::godot::obj::GodotClass>::__UNSAFE_THREADED_OPT_IN
+                        );
+                        #handled_callback
+                    }
+                )
+            }
+        }
     };
 
     quote! {
@@ -364,6 +380,75 @@ impl SignatureInfo {
     /// Returns param types (e.g. `(f32, f64, GString...)`) of this signature as a properly spanned group.
     pub fn params_type(&self) -> Group {
         to_spanned_tuple(&self.param_types, self.params_span)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proc_macro2::Span;
+    use quote::quote;
+
+    use super::{BeforeKind, ReceiverType, SignatureInfo, make_virtual_callback};
+    use crate::util::ident;
+
+    fn primitive_virtual_signature() -> SignatureInfo {
+        SignatureInfo {
+            method_name: ident("primitive_virtual"),
+            receiver_type: ReceiverType::Mut,
+            params_span: Span::call_site(),
+            param_idents: vec![],
+            param_types: vec![],
+            return_type: quote! { i64 },
+            modified_param_types: vec![],
+            optional_param_default_exprs: vec![],
+        }
+    }
+
+    #[test]
+    fn ordinary_virtual_gates_thread_before_storage_claim() {
+        let callback = make_virtual_callback(
+            &ident("ThreadedClass"),
+            &ident("Node"),
+            &primitive_virtual_signature(),
+            BeforeKind::Without,
+            None,
+            false,
+        )
+        .to_string();
+
+        let admission = callback
+            .find("with_ordinary_callback_admission")
+            .expect("ordinary callback must hold a binding-lifetime admission lease");
+        let gate = callback
+            .find("ensure_ordinary_callback_thread")
+            .expect("ordinary callback must contain the early thread gate");
+        let panic_boundary = callback
+            .find("handle_fallible_ptrcall")
+            .expect("ordinary callback must contain the panic boundary");
+        let storage_claim = callback
+            .find("as_storage")
+            .expect("ordinary callback must claim instance storage");
+        assert!(
+            admission < gate && gate < panic_boundary && panic_boundary < storage_claim,
+            "admission must wrap a thread gate which precedes panic conversion and storage claim"
+        );
+    }
+
+    #[test]
+    fn selected_threaded_virtual_does_not_use_ordinary_gate() {
+        let callback = make_virtual_callback(
+            &ident("ThreadedClass"),
+            &ident("Node"),
+            &primitive_virtual_signature(),
+            BeforeKind::Without,
+            None,
+            true,
+        )
+        .to_string();
+
+        assert!(!callback.contains("ensure_ordinary_callback_thread"));
+        assert!(callback.contains("with_threaded_callback_admission"));
+        assert!(callback.contains("with_threaded_callback_scope"));
     }
 }
 
