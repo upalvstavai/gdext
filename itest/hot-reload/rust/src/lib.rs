@@ -64,6 +64,31 @@ impl NoDefault {
 
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 
+/// Exercises hot-reload replacement for the opaque-handle storage path. No virtual callback is
+/// selected for worker dispatch; the opt-in is used here solely so this instance is registered with
+/// blocking storage before and after the extension reload.
+#[derive(GodotClass)]
+#[class(init, base=Node, unsafe_threaded)]
+struct ThreadedReloadable {
+    #[export]
+    #[init(val = 313)]
+    marker: i64,
+}
+
+// SAFETY: this test class has no worker-selected virtuals, contains only `Send` Rust data, and its
+// fields perform no Godot calls from `Drop`.
+unsafe impl godot::obj::ThreadedGodotClass for ThreadedReloadable {}
+
+#[godot_api]
+impl ThreadedReloadable {
+    #[func]
+    fn doubled_marker(&self) -> i64 {
+        self.marker * 2
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
 #[derive(Clone, GodotConvert, Var, Export)]
 #[godot(via = GString)]
 enum Planet {
