@@ -343,6 +343,14 @@ pub unsafe fn initialize(
 /// # Safety
 /// See [`initialize`].
 pub unsafe fn deinitialize() {
+    // Low-level callers may not have a higher-level ExtensionLibrary boundary. The operation is idempotent when godot-core already began
+    // teardown before user deinitializers and class unregistration.
+    unsafe { begin_threaded_callback_teardown() };
+
+    // User and registry teardown have finished by the time this low-level function runs. Revoke the remaining main-thread-only callback
+    // window before verifying and clearing binding storage.
+    unsafe { finish_threaded_callback_teardown() };
+
     // SAFETY: unique caller, from main thread.
     unsafe { deinitialize_binding() };
 
@@ -799,6 +807,9 @@ pub unsafe fn discover_main_thread() {
         unsafe {
             MAIN_THREAD_ID.clear();
             MAIN_THREAD_ID.set(thread_id);
+            // Keep teardown callback admission in sync with the binding's authoritative main-thread identity. Initialization is exclusive,
+            // so no callback can race this update.
+            update_threaded_callback_main_thread();
         }
     }
 }

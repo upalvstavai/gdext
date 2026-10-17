@@ -17,10 +17,29 @@ use crate::{
 use loom::sync::{
     Condvar as CallbackCondvar, Mutex as CallbackMutex, MutexGuard as CallbackMutexGuard,
 };
+#[cfg(loom)]
+use loom::thread::ThreadId as CallbackThreadId;
 #[cfg(not(loom))]
 use std::sync::{
     Condvar as CallbackCondvar, Mutex as CallbackMutex, MutexGuard as CallbackMutexGuard,
 };
+#[cfg(all(not(loom), not(wasm_nothreads)))]
+use std::thread::ThreadId as CallbackThreadId;
+#[cfg(all(not(loom), wasm_nothreads))]
+type CallbackThreadId = ();
+
+#[cfg(loom)]
+fn current_callback_thread_id() -> CallbackThreadId {
+    loom::thread::current().id()
+}
+
+#[cfg(all(not(loom), not(wasm_nothreads)))]
+fn current_callback_thread_id() -> CallbackThreadId {
+    crate::current_thread_id()
+}
+
+#[cfg(all(not(loom), wasm_nothreads))]
+fn current_callback_thread_id() -> CallbackThreadId {}
 
 thread_local! {
     static THREADED_CALLBACK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -42,10 +61,25 @@ struct ThreadedCallbackAdmission {
     drained: CallbackCondvar,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ThreadedCallbackAdmissionPhase {
+    /// No callback can enter and every previously admitted callback has returned.
+    #[default]
+    Closed,
+    /// New callbacks may enter.
+    Open,
+    /// Extension teardown has rejected new worker callbacks. Existing workers may still be draining, while callbacks on the recorded main
+    /// thread remain legal until final binding teardown.
+    MainThreadOnly,
+    /// Final binding teardown rejects every new callback and is waiting for existing main-thread leases to return.
+    Closing,
+}
+
 #[derive(Debug, Default)]
 struct ThreadedCallbackAdmissionState {
-    accepting: bool,
+    phase: ThreadedCallbackAdmissionPhase,
     active: usize,
+    main_thread: Option<CallbackThreadId>,
 }
 
 impl ThreadedCallbackAdmission {
@@ -57,12 +91,57 @@ impl ThreadedCallbackAdmission {
 
     fn open(&self) {
         let mut state = self.lock_state();
-        assert!(!state.accepting, "threaded callback admission opened twice");
+        assert_eq!(
+            state.phase,
+            ThreadedCallbackAdmissionPhase::Closed,
+            "threaded callback admission opened before the previous teardown completed"
+        );
         assert_eq!(
             state.active, 0,
             "threaded callback admission reopened with active callbacks"
         );
-        state.accepting = true;
+        state.phase = ThreadedCallbackAdmissionPhase::Open;
+        state.main_thread = Some(current_callback_thread_id());
+    }
+
+    fn ensure_open_for_level_init(&self) {
+        let mut state = self.lock_state();
+        match state.phase {
+            // Ordinary startup invokes one callback per initialization level after low-level binding initialization has already opened the
+            // gate. Those later levels are intentionally idempotent.
+            ThreadedCallbackAdmissionPhase::Open => {}
+            // Godot can deinitialize levels and later reinitialize Scene+ without a fresh low-level binding initialization (gdext#629).
+            // The preceding close drained every lease, so the first returning level starts a new callback-admission cycle.
+            ThreadedCallbackAdmissionPhase::Closed => {
+                assert_eq!(
+                    state.active, 0,
+                    "threaded callback admission reopened with active callbacks"
+                );
+                state.phase = ThreadedCallbackAdmissionPhase::Open;
+                state.main_thread = Some(current_callback_thread_id());
+            }
+            ThreadedCallbackAdmissionPhase::MainThreadOnly => {
+                assert_eq!(
+                    state.active, 0,
+                    "initialization level resumed before worker callbacks drained"
+                );
+                state.phase = ThreadedCallbackAdmissionPhase::Open;
+                state.main_thread = Some(current_callback_thread_id());
+            }
+            ThreadedCallbackAdmissionPhase::Closing => {
+                panic!("initialization level resumed before threaded callback teardown drained")
+            }
+        }
+    }
+
+    fn update_main_thread(&self) {
+        let mut state = self.lock_state();
+        assert_eq!(
+            state.phase,
+            ThreadedCallbackAdmissionPhase::Open,
+            "main-thread identity changed outside extension initialization"
+        );
+        state.main_thread = Some(current_callback_thread_id());
     }
 
     fn enter(&self) -> ThreadedCallbackLease<'_> {
@@ -72,8 +151,13 @@ impl ThreadedCallbackAdmission {
 
     fn try_enter(&self) -> Option<ThreadedCallbackLease<'_>> {
         let mut state = self.lock_state();
-        if !state.accepting {
-            return None;
+        match state.phase {
+            ThreadedCallbackAdmissionPhase::Open => {}
+            ThreadedCallbackAdmissionPhase::MainThreadOnly
+                if state.main_thread == Some(current_callback_thread_id()) => {}
+            ThreadedCallbackAdmissionPhase::MainThreadOnly
+            | ThreadedCallbackAdmissionPhase::Closing
+            | ThreadedCallbackAdmissionPhase::Closed => return None,
         }
 
         state.active = state
@@ -83,11 +167,20 @@ impl ThreadedCallbackAdmission {
         Some(ThreadedCallbackLease { admission: self })
     }
 
-    fn close_and_wait(&self) {
+    fn close_workers_and_wait(&self) {
         let mut state = self.lock_state();
-        assert!(state.accepting, "threaded callback admission closed twice");
-        state.accepting = false;
-        self.drained.notify_all();
+        match state.phase {
+            ThreadedCallbackAdmissionPhase::Open => {
+                state.phase = ThreadedCallbackAdmissionPhase::MainThreadOnly;
+                // Wake tests and any second teardown caller waiting for the phase transition.
+                self.drained.notify_all();
+            }
+            // The earliest high-level teardown boundary closes the gate. Later init-level callbacks and low-level binding deinitialization
+            // deliberately repeat the operation, so closing must be idempotent.
+            ThreadedCallbackAdmissionPhase::MainThreadOnly
+            | ThreadedCallbackAdmissionPhase::Closing
+            | ThreadedCallbackAdmissionPhase::Closed => {}
+        }
 
         while state.active != 0 {
             state = self
@@ -97,10 +190,55 @@ impl ThreadedCallbackAdmission {
         }
     }
 
-    #[cfg(test)]
-    fn wait_until_closed(&self) {
+    fn close_all_and_wait(&self) {
         let mut state = self.lock_state();
-        while state.accepting {
+        match state.phase {
+            ThreadedCallbackAdmissionPhase::Open
+            | ThreadedCallbackAdmissionPhase::MainThreadOnly => {
+                state.phase = ThreadedCallbackAdmissionPhase::Closing;
+                self.drained.notify_all();
+            }
+            ThreadedCallbackAdmissionPhase::Closing | ThreadedCallbackAdmissionPhase::Closed => {}
+        }
+
+        while state.active != 0 {
+            state = self
+                .drained
+                .wait(state)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+
+        state.phase = ThreadedCallbackAdmissionPhase::Closed;
+        state.main_thread = None;
+        self.drained.notify_all();
+    }
+
+    #[cfg(test)]
+    fn close_and_wait(&self) {
+        self.close_all_and_wait();
+    }
+
+    fn assert_closed_and_drained(&self) {
+        let state = self.lock_state();
+        assert_eq!(
+            state.phase,
+            ThreadedCallbackAdmissionPhase::Closed,
+            "binding deinitialization reached storage clearing before threaded callbacks were closed and drained"
+        );
+        assert_eq!(
+            state.active, 0,
+            "binding deinitialization reached storage clearing with active threaded callbacks"
+        );
+        assert!(
+            state.main_thread.is_none(),
+            "binding deinitialization retained a stale callback main-thread identity"
+        );
+    }
+
+    #[cfg(test)]
+    fn wait_until_not_accepting(&self) {
+        let mut state = self.lock_state();
+        while state.phase == ThreadedCallbackAdmissionPhase::Open {
             state = self
                 .drained
                 .wait(state)
@@ -170,7 +308,65 @@ pub(super) fn open_threaded_callback_admission() {
     threaded_callback_admission().open();
 }
 
-pub(super) fn close_threaded_callback_admission_and_wait() {
+/// Keeps callback admission open during ordinary multi-level initialization, or reopens it after Godot partially unloaded and then resumed
+/// initialization levels without recreating the low-level binding.
+///
+/// # Safety
+///
+/// Must be called on the engine initialization thread before internal or user initialization for the returning level. A prior teardown must
+/// have completely drained before Godot begins reinitialization.
+#[doc(hidden)]
+pub unsafe fn resume_threaded_callback_admission_for_level_init() {
+    threaded_callback_admission().ensure_open_for_level_init();
+}
+
+/// Refreshes the main-thread identity used to admit synchronous teardown callbacks.
+///
+/// # Safety
+///
+/// Must be called during exclusive extension initialization, after the engine has moved initialization to the new main thread and before any
+/// user callback can run there.
+#[doc(hidden)]
+pub unsafe fn update_threaded_callback_main_thread() {
+    threaded_callback_admission().update_main_thread();
+}
+
+pub(super) fn assert_threaded_callback_teardown_complete() {
+    threaded_callback_admission().assert_closed_and_drained();
+}
+
+/// Stops new worker-thread callbacks and waits for every previously admitted trampoline to return.
+///
+/// This is idempotent within one binding lifetime: the MainLoop shutdown callback, each later initialization-level deinitializer, and final
+/// low-level binding teardown may all call it. The first caller linearizes worker teardown; later callers only verify or wait for the same
+/// drain. Synchronous callbacks on the recorded main thread remain legal for user deinitializers and class cleanup until
+/// [`finish_threaded_callback_teardown`] closes the final window. A subsequent successful binding initialization opens a fresh cycle.
+///
+/// # Safety
+///
+/// Must be called on the engine's deinitialization thread at the first extension teardown boundary, before user teardown code or callback
+/// userdata can be destroyed. The engine must not require a newly dispatched explicitly threaded callback to complete teardown after this
+/// boundary; such a late worker callback is rejected fail-stop.
+#[doc(hidden)]
+pub unsafe fn begin_threaded_callback_teardown() {
+    begin_threaded_callback_teardown_in(threaded_callback_admission());
+}
+
+fn begin_threaded_callback_teardown_in(admission: &ThreadedCallbackAdmission) {
+    assert!(
+        !is_in_threaded_callback_admission(),
+        "binding teardown cannot run from inside an admitted threaded callback"
+    );
+    admission.close_workers_and_wait();
+}
+
+/// Rejects every new callback and drains any remaining main-thread callback before binding storage is cleared.
+///
+/// # Safety
+///
+/// Must be called on the engine's final deinitialization thread after all user teardown and callback-userdata destruction has completed.
+#[doc(hidden)]
+pub unsafe fn finish_threaded_callback_teardown() {
     close_threaded_callback_admission_and_wait_in(threaded_callback_admission());
 }
 
@@ -179,7 +375,7 @@ fn close_threaded_callback_admission_and_wait_in(admission: &ThreadedCallbackAdm
         !is_in_threaded_callback_admission(),
         "binding teardown cannot run from inside an admitted threaded callback"
     );
-    admission.close_and_wait();
+    admission.close_all_and_wait();
 }
 
 /// Whether scoped worker callbacks can use eagerly initialized binding tables in this build.
@@ -240,13 +436,14 @@ pub struct ThreadedCallbackToken<'a> {
 ///
 /// The scope includes panic/error conversion after the user method returns because that code can log through the Godot binding. Same-thread
 /// synchronous re-entry while an admitted trampoline is active reuses the outer lease, which remains alive for the complete nested call stack.
-/// A callback dispatched on another thread is a new admission and must begin before binding teardown closes the gate.
-/// A callback which violates that shutdown contract is rejected with a fail-stop panic before its body starts; generated `extern "C"`
-/// trampolines cannot turn such an engine lifecycle violation into a generally valid ABI return value.
+/// A callback dispatched on another thread is a new admission and must begin before extension teardown closes worker admission. Main-thread
+/// callbacks remain admissible for synchronous user/class cleanup until final binding teardown. A callback which violates that shutdown
+/// contract is rejected with a fail-stop panic before its body starts; generated `extern "C"` trampolines cannot turn such an engine lifecycle
+/// violation into a generally valid ABI return value.
 ///
 /// # Safety
 /// `callback` must be the complete synchronous body of a Godot callback covered by an explicit unsafe threaded class/interface contract. A
-/// callback starting on a different thread is a new admission and must enter before binding teardown closes the gate.
+/// callback starting on a different thread is a new admission and must enter before extension teardown closes worker admission.
 #[doc(hidden)]
 pub unsafe fn with_threaded_callback_admission<R>(
     callback: impl FnOnce(&ThreadedCallbackToken<'_>) -> R,
@@ -477,7 +674,7 @@ mod ordinary_callback_thread_tests {
 
             entered_rx.recv().unwrap();
             let close = scope.spawn(|| admission.close_and_wait());
-            admission.wait_until_closed();
+            admission.wait_until_not_accepting();
             assert!(!close.is_finished());
 
             release_tx.send(()).unwrap();
@@ -596,9 +793,9 @@ mod threaded_callback_tests {
     use std::sync::{Arc, Barrier};
 
     use super::{
-        ThreadedCallbackAdmission, ThreadedCallbackToken,
-        close_threaded_callback_admission_and_wait_in, is_in_threaded_callback,
-        with_threaded_callback_admission_in, with_threaded_callback_scope,
+        ThreadedCallbackAdmission, ThreadedCallbackAdmissionPhase, ThreadedCallbackToken,
+        begin_threaded_callback_teardown_in, close_threaded_callback_admission_and_wait_in,
+        is_in_threaded_callback, with_threaded_callback_admission_in, with_threaded_callback_scope,
     };
 
     unsafe fn with_local_admission<R>(
@@ -667,7 +864,7 @@ mod threaded_callback_tests {
 
         std::thread::scope(|scope| {
             let close = scope.spawn(|| admission.close_and_wait());
-            admission.wait_until_closed();
+            admission.wait_until_not_accepting();
             assert!(!close.is_finished());
 
             drop(lease);
@@ -706,7 +903,7 @@ mod threaded_callback_tests {
             }
 
             let close = scope.spawn(|| admission.close_and_wait());
-            admission.wait_until_closed();
+            admission.wait_until_not_accepting();
             assert!(!close.is_finished());
 
             for _ in 1..CALLBACKS {
@@ -730,7 +927,7 @@ mod threaded_callback_tests {
         });
 
         let state = admission.lock_state();
-        assert!(!state.accepting);
+        assert_eq!(state.phase, ThreadedCallbackAdmissionPhase::Closed);
         assert_eq!(state.active, 0);
     }
 
@@ -747,7 +944,7 @@ mod threaded_callback_tests {
                 assert!(result.is_err());
 
                 let state = admission.lock_state();
-                assert!(state.accepting);
+                assert_eq!(state.phase, ThreadedCallbackAdmissionPhase::Open);
                 assert_eq!(state.active, 1);
             });
         }
@@ -783,7 +980,7 @@ mod threaded_callback_tests {
 
             invocation_done_rx.recv().unwrap();
             let close = scope.spawn(|| admission.close_and_wait());
-            admission.wait_until_closed();
+            admission.wait_until_not_accepting();
             assert!(!close.is_finished());
 
             finish_tx.send(()).unwrap();
@@ -815,7 +1012,7 @@ mod threaded_callback_tests {
 
             outer_entered_rx.recv().unwrap();
             let close = scope.spawn(|| admission.close_and_wait());
-            admission.wait_until_closed();
+            admission.wait_until_not_accepting();
             assert!(!close.is_finished());
 
             // This models an engine worker which reaches a callback only after teardown has linearized. Its body must never run and its
@@ -832,7 +1029,7 @@ mod threaded_callback_tests {
             assert!(!late_body_ran.load(Ordering::SeqCst));
             {
                 let state = admission.lock_state();
-                assert!(!state.accepting);
+                assert_eq!(state.phase, ThreadedCallbackAdmissionPhase::Closing);
                 assert_eq!(state.active, 1);
             }
             assert!(!close.is_finished());
@@ -843,7 +1040,7 @@ mod threaded_callback_tests {
         });
 
         let state = admission.lock_state();
-        assert!(!state.accepting);
+        assert_eq!(state.phase, ThreadedCallbackAdmissionPhase::Closed);
         assert_eq!(state.active, 0);
     }
 
@@ -856,6 +1053,166 @@ mod threaded_callback_tests {
             unsafe { with_local_admission(&admission, |_| {}) };
             admission.close_and_wait();
         }
+    }
+
+    #[test]
+    fn earliest_teardown_boundary_drains_before_user_state_destruction_and_rejects_late_callbacks()
+    {
+        let admission = ThreadedCallbackAdmission::default();
+        admission.open();
+
+        let user_state_destroyed = AtomicBool::new(false);
+        let late_body_ran = AtomicBool::new(false);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+
+        std::thread::scope(|scope| {
+            let admission_ref = &admission;
+            let user_state_destroyed_ref = &user_state_destroyed;
+            let callback = scope.spawn(move || unsafe {
+                with_local_admission(admission_ref, |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    assert!(!user_state_destroyed_ref.load(Ordering::SeqCst));
+                });
+            });
+            entered_rx.recv().unwrap();
+
+            let admission_ref = &admission;
+            let user_state_destroyed_ref = &user_state_destroyed;
+            let teardown = scope.spawn(move || {
+                begin_threaded_callback_teardown_in(admission_ref);
+                // Models the first user deinitializer / class-unregistration action after the boundary helper returns.
+                user_state_destroyed_ref.store(true, Ordering::SeqCst);
+            });
+
+            admission.wait_until_not_accepting();
+            assert!(!teardown.is_finished());
+            assert!(!user_state_destroyed.load(Ordering::SeqCst));
+
+            let admission_ref = &admission;
+            let late_body_ran_ref = &late_body_ran;
+            let late = scope.spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    with_local_admission(admission_ref, |_| {
+                        late_body_ran_ref.store(true, Ordering::SeqCst);
+                    });
+                }))
+            });
+            assert!(late.join().unwrap().is_err());
+            assert!(!late_body_ran.load(Ordering::SeqCst));
+            assert!(!user_state_destroyed.load(Ordering::SeqCst));
+
+            release_tx.send(()).unwrap();
+            callback.join().unwrap();
+            teardown.join().unwrap();
+        });
+
+        assert!(user_state_destroyed.load(Ordering::SeqCst));
+        {
+            let state = admission.lock_state();
+            assert_eq!(state.phase, ThreadedCallbackAdmissionPhase::MainThreadOnly);
+            assert_eq!(state.active, 0);
+        }
+
+        // User/class teardown can still synchronously invoke a blocking callback on the main thread.
+        unsafe { with_local_admission(&admission, |_| {}) };
+
+        // A worker remains rejected throughout the main-thread teardown window.
+        let late_worker_body_ran = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let late_worker_body_ran_ref = &late_worker_body_ran;
+            let admission_ref = &admission;
+            let late_worker = scope.spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    with_local_admission(admission_ref, |_| {
+                        late_worker_body_ran_ref.store(true, Ordering::SeqCst);
+                    });
+                }))
+            });
+            assert!(late_worker.join().unwrap().is_err());
+        });
+        assert!(!late_worker_body_ran.load(Ordering::SeqCst));
+
+        // Later init-level boundaries repeat the worker close without a double-close failure. Final low-level teardown then closes main too.
+        begin_threaded_callback_teardown_in(&admission);
+        close_threaded_callback_admission_and_wait_in(&admission);
+        admission.assert_closed_and_drained();
+    }
+
+    #[test]
+    fn partial_level_reinit_reopens_after_complete_drain() {
+        let admission = ThreadedCallbackAdmission::default();
+
+        // Full binding init, followed by idempotent Core/Servers/Scene/Editor level init callbacks.
+        admission.open();
+        for _ in 0..4 {
+            admission.ensure_open_for_level_init();
+        }
+        unsafe { with_local_admission(&admission, |_| {}) };
+
+        // A partial level unload closes the gate even though the low-level binding remains alive.
+        begin_threaded_callback_teardown_in(&admission);
+        unsafe { with_local_admission(&admission, |_| {}) };
+        std::thread::scope(|scope| {
+            let admission_ref = &admission;
+            assert!(
+                scope
+                    .spawn(move || admission_ref.try_enter().is_none())
+                    .join()
+                    .unwrap()
+            );
+        });
+
+        // The first resumed level opens a fresh cycle; subsequent level callbacks remain idempotent.
+        admission.ensure_open_for_level_init();
+        admission.ensure_open_for_level_init();
+        unsafe { with_local_admission(&admission, |_| {}) };
+
+        admission.close_and_wait();
+        admission.assert_closed_and_drained();
+    }
+
+    #[test]
+    fn main_thread_identity_refresh_controls_teardown_admission() {
+        let admission = ThreadedCallbackAdmission::default();
+        admission.open();
+        let (updated_tx, updated_rx) = std::sync::mpsc::sync_channel(0);
+        let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
+        let new_main_body_ran = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            let admission_ref = &admission;
+            let new_main_body_ran_ref = &new_main_body_ran;
+            let new_main = scope.spawn(move || {
+                // Models Android moving initialization to another main thread at Servers level.
+                admission_ref.update_main_thread();
+                updated_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+
+                unsafe {
+                    with_local_admission(admission_ref, |_| {
+                        new_main_body_ran_ref.store(true, Ordering::SeqCst);
+                    });
+                }
+            });
+
+            updated_rx.recv().unwrap();
+            begin_threaded_callback_teardown_in(&admission);
+
+            // The former main thread is now treated as a worker during teardown.
+            let former_main = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                with_local_admission(&admission, |_| {});
+            }));
+            assert!(former_main.is_err());
+
+            continue_tx.send(()).unwrap();
+            new_main.join().unwrap();
+        });
+
+        assert!(new_main_body_ran.load(Ordering::SeqCst));
+        admission.close_and_wait();
+        admission.assert_closed_and_drained();
     }
 
     #[test]
@@ -872,7 +1229,7 @@ mod threaded_callback_tests {
         assert!(result.is_err());
         assert!(!body_ran.load(Ordering::SeqCst));
         let state = admission.lock_state();
-        assert!(!state.accepting);
+        assert_eq!(state.phase, ThreadedCallbackAdmissionPhase::Closed);
         assert_eq!(state.active, 0);
     }
 }
@@ -904,7 +1261,7 @@ mod experimental_threaded_callback_admission_tests {
 
         std::thread::scope(|scope| {
             let close = scope.spawn(|| admission.close_and_wait());
-            admission.wait_until_closed();
+            admission.wait_until_not_accepting();
             assert!(!close.is_finished());
 
             drop(lease);
@@ -933,7 +1290,7 @@ mod experimental_threaded_callback_admission_tests {
 
             outer_entered_rx.recv().unwrap();
             let close = scope.spawn(|| admission.close_and_wait());
-            admission.wait_until_closed();
+            admission.wait_until_not_accepting();
             assert!(!close.is_finished());
 
             finish_tx.send(()).unwrap();
@@ -969,7 +1326,10 @@ mod loom_threaded_callback_admission_tests {
     use loom::sync::{Arc, mpsc};
     use loom::thread;
 
-    use super::{ThreadedCallbackAdmission, with_threaded_callback_admission_in};
+    use super::{
+        ThreadedCallbackAdmission, ThreadedCallbackAdmissionPhase,
+        begin_threaded_callback_teardown_in, with_threaded_callback_admission_in,
+    };
 
     fn check_admission_model(worker_count: usize, preemption_bound: Option<usize>) {
         let mut model = loom::model::Builder::new();
@@ -1026,7 +1386,7 @@ mod loom_threaded_callback_admission_tests {
             assert!(close_returned.load(Ordering::SeqCst));
             {
                 let state = admission.lock_state();
-                assert!(!state.accepting);
+                assert_eq!(state.phase, ThreadedCallbackAdmissionPhase::Closed);
                 assert_eq!(state.active, 0);
             }
 
@@ -1059,7 +1419,7 @@ mod loom_threaded_callback_admission_tests {
             let worker = thread::spawn(move || unsafe {
                 with_threaded_callback_admission_in(&worker_admission, |_| {
                     outer_entered_tx.send(()).unwrap();
-                    worker_admission.wait_until_closed();
+                    worker_admission.wait_until_not_accepting();
 
                     // The outer synchronous stack still owns its lease. Re-entry after close must reuse it instead of trying to open a new
                     // admission, otherwise teardown can deadlock while waiting for the outer callback which is waiting for its nested call.
@@ -1075,6 +1435,45 @@ mod loom_threaded_callback_admission_tests {
 
             assert_eq!(nested_bodies.load(Ordering::SeqCst), 1);
             assert!(admission.try_enter().is_none());
+        });
+    }
+
+    #[test]
+    fn loom_worker_boundary_drains_workers_then_preserves_main_until_final_close() {
+        loom::model(|| {
+            let admission = Arc::new(ThreadedCallbackAdmission::default());
+            admission.open();
+            let worker_body_completed = Arc::new(AtomicBool::new(false));
+
+            let worker_admission = Arc::clone(&admission);
+            let worker_completed = Arc::clone(&worker_body_completed);
+            let worker = thread::spawn(move || {
+                if let Some(lease) = worker_admission.try_enter() {
+                    thread::yield_now();
+                    worker_completed.store(true, Ordering::SeqCst);
+                    drop(lease);
+                    true
+                } else {
+                    false
+                }
+            });
+
+            begin_threaded_callback_teardown_in(&admission);
+            let worker_was_admitted = worker.join().unwrap();
+            assert_eq!(
+                worker_body_completed.load(Ordering::SeqCst),
+                worker_was_admitted
+            );
+
+            // The boundary caller is the recorded main thread and remains admissible while user/class teardown runs.
+            assert!(admission.try_enter().is_some());
+
+            let late_worker_admission = Arc::clone(&admission);
+            let late_worker = thread::spawn(move || late_worker_admission.try_enter().is_none());
+            assert!(late_worker.join().unwrap());
+
+            admission.close_all_and_wait();
+            admission.assert_closed_and_drained();
         });
     }
 }

@@ -142,6 +142,12 @@ unsafe extern "C" fn frame_func<E: ExtensionLibrary>() {
 
 #[cfg(since_api = "4.5")]
 unsafe extern "C" fn shutdown_func<E: ExtensionLibrary>() {
+    // This is the earliest extension teardown boundary on Godot 4.5+. Stop new worker-thread callbacks and wait for every callback
+    // already inside a generated trampoline before user teardown can destroy extension state. Later init-level and low-level deinitializers
+    // repeat this idempotent operation.
+    // SAFETY: Godot invokes this callback on its main deinitialization thread, before per-level teardown.
+    unsafe { sys::begin_threaded_callback_teardown() };
+
     // The main loop (SceneTree) is being torn down. Mark the async runtime as exiting, so a signal future whose object is freed during teardown
     // is left suspended (and dropped in cleanup()) instead of being woken into a spurious panic. See `async_runtime::is_engine_exiting()`.
     crate::task::mark_engine_exiting();
@@ -225,6 +231,11 @@ unsafe extern "C" fn ffi_initialize_layer<E: ExtensionLibrary>(
     init_level: sys::GDExtensionInitializationLevel,
 ) {
     unsafe {
+        // Usually low-level binding initialization already opened admission and this is a no-op. Godot can also deinitialize levels and later
+        // resume Scene+ without recreating the binding (gdext#629); reopen the fully drained gate before internal or user init in that case.
+        // SAFETY: Godot invokes initialization levels serially on its initialization thread.
+        sys::resume_threaded_callback_admission_for_level_init();
+
         let userdata = userdata.cast::<InitUserData>().as_ref().unwrap();
         let level = InitLevel::from_sys(init_level);
         let ctx = format!("ExtensionLibrary::on_stage_init({level:?})");
@@ -263,6 +274,12 @@ unsafe extern "C" fn ffi_deinitialize_layer<E: ExtensionLibrary>(
     init_level: sys::GDExtensionInitializationLevel,
 ) {
     unsafe {
+        // On Godot 4.2-4.4 this is the earliest extension teardown boundary. On newer Godot versions and subsequent init levels it repeats
+        // the worker close+drain begun by shutdown_func; the operation is intentionally idempotent. It must precede even level conversion, userdata
+        // release and user callbacks so admitted worker trampolines cannot observe torn-down extension state or freed method userdata.
+        // SAFETY: Godot invokes per-level deinitialization on its main deinitialization thread.
+        sys::begin_threaded_callback_teardown();
+
         let level = InitLevel::from_sys(init_level);
         let ctx = format!("ExtensionLibrary::on_stage_deinit({level:?})");
 

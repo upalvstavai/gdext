@@ -73,13 +73,13 @@ impl BindingStorage {
     /// Deinitialize the binding storage.
     ///
     /// # Safety
-    /// Must be called from the main thread.
+    /// - Must be called from the main thread.
+    /// - [`super::finish_threaded_callback_teardown`] must have closed and drained every explicit callback before this final storage step.
     ///
     /// # Panics
     /// If called while not initialized.
     pub unsafe fn deinitialize() {
-        // SAFETY: Ordinary binding access has stopped. Explicitly admitted worker callbacks are the sole exception and are drained below
-        // before the ManualInitCell is cleared.
+        // SAFETY: Ordinary binding access has stopped, and final callback teardown has already drained the explicitly admitted exception.
         let storage = unsafe { Self::storage() };
 
         assert!(
@@ -87,9 +87,10 @@ impl BindingStorage {
             "deinitialize without prior initialize"
         );
 
-        // Stop new scoped worker callbacks and retain the binding until every admitted callback has returned. This closes the check/use race
-        // between `get_binding_unchecked()` and clearing the backing ManualInitCell.
-        super::close_threaded_callback_admission_and_wait();
+        // High-level lifecycle teardown must already have stopped new callbacks and drained every complete trampoline before any user
+        // deinitializer or registration cleanup ran. Verify that contract again at the final storage boundary before clearing the backing
+        // ManualInitCell.
+        super::assert_threaded_callback_teardown_complete();
 
         // Mark the binding not-live before clearing it. Ordinary main-thread access is already excluded by this function's safety contract.
         storage.initialized.store(false, Ordering::Release);

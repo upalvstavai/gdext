@@ -64,9 +64,9 @@ impl BindingStorage {
     /// Deinitialize the binding storage.
     ///
     /// # Safety
-    /// Explicitly admitted threaded callbacks may still be active when this starts; this method closes their admission and drains them before
-    /// clearing the binding. Every other `experimental-threads` access remains subject to [`initialize`](BindingStorage::initialize): the
-    /// caller must exclude it from teardown.
+    /// Explicitly admitted threaded callbacks must already be closed and drained by [`super::finish_threaded_callback_teardown`] before this
+    /// final storage step. Every other `experimental-threads` access remains subject to [`initialize`](BindingStorage::initialize): the caller
+    /// must exclude it from teardown.
     pub unsafe fn deinitialize() {
         let storage = Self::storage();
 
@@ -75,9 +75,10 @@ impl BindingStorage {
             "deinitialize must only be called after initialize"
         );
 
-        // Explicitly opted-in callbacks carry a binding-lifetime lease even in the global multi-threaded mode. Stop admitting new ones and
-        // wait for every complete trampoline (including its post-invocation diagnostics) before invalidating the binding.
-        super::close_threaded_callback_admission_and_wait();
+        // Explicitly opted-in callbacks carry a binding-lifetime lease even in the global multi-threaded mode. High-level lifecycle teardown
+        // must already have closed and drained those leases before user state was destroyed; verify that contract at the final storage
+        // boundary before invalidating the binding.
+        super::assert_threaded_callback_teardown_complete();
 
         // Mark the binding not-live *before* clearing it. Other uses enabled solely by `experimental-threads` remain subject to this module's
         // existing safety contract: the caller must ensure that they do not overlap deinitialization.

@@ -142,8 +142,9 @@ pub enum ClassThreading {
 /// - finish all work which relies on the callback's binding permission before returning. Permission is thread-local, is not inherited by
 ///   spawned threads, and does not cover deferred work or values whose safety depends on the callback after it returns;
 /// - ensure the engine stops dispatching new opted-in callbacks before extension deinitialization or library unload begins. Callbacks admitted
-///   before shutdown are drained, but a new callback beginning after admission closes violates this contract and is rejected fail-stop before
-///   its body runs;
+///   before shutdown are drained, but a new worker callback beginning after worker admission closes violates this contract and is rejected
+///   fail-stop before its body runs. Main-thread callbacks remain available for synchronous deinitialization cleanup until final binding
+///   teardown;
 /// - make dropping `Self` and every non-`Base<T>` field safe on any thread which can release the final storage claim. If Godot frees the
 ///   object during a worker, reference, or unreference callback, that callback may run `Drop`. Worker FFI permission is revoked before the
 ///   final claim drops, so `Drop` and field destructors must not access the base object, operate on Godot objects, or call Godot APIs.
