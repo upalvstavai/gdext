@@ -5,6 +5,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::ThreadId;
+use std::time::{Duration, Instant};
+
+use godot::classes::{IResourceFormatLoader, Resource, ResourceFormatLoader};
 use godot::prelude::*;
 
 struct HotReload;
@@ -84,6 +90,133 @@ impl ThreadedReloadable {
     #[func]
     fn doubled_marker(&self) -> i64 {
         self.marker * 2
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
+const THREADED_RELOAD_EXTENSION: &str = "gdext_threaded_hot_reload";
+const THREADED_RELOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+static THREADED_RELOAD_MAIN_THREAD: Mutex<Option<ThreadId>> = Mutex::new(None);
+static THREADED_RELOAD_RELEASE_PATH: Mutex<String> = Mutex::new(String::new());
+static THREADED_RELOAD_COMPLETED_PATH: Mutex<String> = Mutex::new(String::new());
+static THREADED_RELOAD_TIMEOUT_PATH: Mutex<String> = Mutex::new(String::new());
+static THREADED_RELOAD_ARMED: AtomicBool = AtomicBool::new(false);
+static THREADED_RELOAD_ENTERED: AtomicBool = AtomicBool::new(false);
+static THREADED_RELOAD_LAST_CALLBACK_WAS_WORKER: AtomicBool = AtomicBool::new(false);
+static THREADED_RELOAD_LOAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(GodotClass)]
+#[class(no_init, base=Object)]
+struct ThreadedReloadProbe;
+
+#[godot_api]
+impl ThreadedReloadProbe {
+    #[func]
+    fn arm_gate(release_path: GString, completed_path: GString, timeout_path: GString) {
+        *THREADED_RELOAD_MAIN_THREAD.lock().unwrap() = Some(std::thread::current().id());
+        *THREADED_RELOAD_RELEASE_PATH.lock().unwrap() = release_path.to_string();
+        *THREADED_RELOAD_COMPLETED_PATH.lock().unwrap() = completed_path.to_string();
+        *THREADED_RELOAD_TIMEOUT_PATH.lock().unwrap() = timeout_path.to_string();
+        THREADED_RELOAD_ENTERED.store(false, Ordering::SeqCst);
+        THREADED_RELOAD_LAST_CALLBACK_WAS_WORKER.store(false, Ordering::SeqCst);
+        THREADED_RELOAD_LOAD_COUNT.store(0, Ordering::SeqCst);
+        THREADED_RELOAD_ARMED.store(true, Ordering::SeqCst);
+    }
+
+    #[func]
+    fn arm_open_probe() {
+        *THREADED_RELOAD_MAIN_THREAD.lock().unwrap() = Some(std::thread::current().id());
+        THREADED_RELOAD_ENTERED.store(false, Ordering::SeqCst);
+        THREADED_RELOAD_LAST_CALLBACK_WAS_WORKER.store(false, Ordering::SeqCst);
+        THREADED_RELOAD_LOAD_COUNT.store(0, Ordering::SeqCst);
+        THREADED_RELOAD_ARMED.store(false, Ordering::SeqCst);
+    }
+
+    #[func]
+    fn callback_entered() -> bool {
+        THREADED_RELOAD_ENTERED.load(Ordering::SeqCst)
+    }
+
+    #[func]
+    fn last_callback_was_worker() -> bool {
+        THREADED_RELOAD_LAST_CALLBACK_WAS_WORKER.load(Ordering::SeqCst)
+    }
+
+    #[func]
+    fn load_count() -> i64 {
+        THREADED_RELOAD_LOAD_COUNT.load(Ordering::SeqCst) as i64
+    }
+}
+
+/// A real engine-dispatched worker callback kept alive across the instant hot reload starts.
+///
+/// The callback gate is released by the external hot-reload harness through a marker file. This is
+/// deliberate: calling another extension method from a helper thread during unload would itself be
+/// a callback-admission race, while a detached Rust helper could outlive the dylib that contains
+/// its code.
+#[derive(GodotClass)]
+#[class(init, base=ResourceFormatLoader, unsafe_threaded)]
+struct ThreadedHotReloadLoader {
+    base: Base<ResourceFormatLoader>,
+}
+
+// SAFETY: selected virtuals use synchronized Rust globals plus `std::fs`, and never access `base`
+// or another Godot object. The owner keeps this loader registered and strongly referenced until
+// the active request has drained and hot reload has completed. No field calls Godot from `Drop`.
+unsafe impl godot::obj::ThreadedGodotClass for ThreadedHotReloadLoader {}
+
+#[godot_api(unsafe_threaded)]
+impl IResourceFormatLoader for ThreadedHotReloadLoader {
+    fn get_recognized_extensions(&self) -> PackedStringArray {
+        [GString::from(THREADED_RELOAD_EXTENSION)]
+            .into_iter()
+            .collect()
+    }
+
+    fn get_resource_type(&self, _path: GString) -> GString {
+        "ThreadedHotReloadResource".into()
+    }
+
+    fn load(
+        &self,
+        _path: GString,
+        _original_path: GString,
+        _use_sub_threads: bool,
+        _cache_mode: i32,
+    ) -> Variant {
+        THREADED_RELOAD_LOAD_COUNT.fetch_add(1, Ordering::SeqCst);
+
+        let main_thread = *THREADED_RELOAD_MAIN_THREAD.lock().unwrap();
+        THREADED_RELOAD_LAST_CALLBACK_WAS_WORKER.store(
+            main_thread.is_some_and(|main| main != std::thread::current().id()),
+            Ordering::SeqCst,
+        );
+
+        if THREADED_RELOAD_ARMED.swap(false, Ordering::SeqCst) {
+            THREADED_RELOAD_ENTERED.store(true, Ordering::SeqCst);
+
+            let release_path = THREADED_RELOAD_RELEASE_PATH.lock().unwrap().clone();
+            let deadline = Instant::now() + THREADED_RELOAD_WAIT_TIMEOUT;
+            while !std::path::Path::new(&release_path).exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+
+            if std::path::Path::new(&release_path).exists() {
+                let completed_path = THREADED_RELOAD_COMPLETED_PATH.lock().unwrap().clone();
+                std::fs::write(
+                    completed_path,
+                    b"callback completed after external release\n",
+                )
+                .expect("write threaded hot-reload completion marker");
+            } else {
+                let timeout_path = THREADED_RELOAD_TIMEOUT_PATH.lock().unwrap().clone();
+                let _ = std::fs::write(timeout_path, b"threaded hot-reload callback timed out\n");
+            }
+        }
+
+        Resource::new_gd().to_variant()
     }
 }
 

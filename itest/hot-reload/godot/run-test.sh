@@ -25,6 +25,10 @@ fi
 # Restore un-reloaded files on exit (for local testing).
 cleanedUp=0 # avoid recursion if cleanup fails
 godotPid=0 # kill previous instance if necessary
+threadedReleaseFile="$PWD/.threaded_reload_release"
+threadedStartedFile="$PWD/.threaded_reload_started"
+threadedCompletedFile="$PWD/.threaded_reload_completed"
+threadedTimeoutFile="$PWD/.threaded_reload_timeout"
 
 cleanup() {
   if [[ $cleanedUp -eq 0 ]]; then
@@ -34,6 +38,7 @@ cleanup() {
       kill $godotPid || true # ignore errors here
     fi
     echo "[Bash]      Cleanup..."
+    rm -f "$threadedReleaseFile" "$threadedStartedFile" "$threadedCompletedFile" "$threadedTimeoutFile"
     git checkout --quiet $rel/../rust/src/lib.rs $rel/rust.gdextension $rel/MainScene.tscn || true # ignore errors here
   fi
 }
@@ -57,6 +62,8 @@ godotAwait() {
     exit 1
   fi
 
+  rm -f "$threadedReleaseFile" "$threadedStartedFile" "$threadedCompletedFile" "$threadedTimeoutFile"
+
   $GODOT_BIN -e --headless --path $rel &
   godotPid=$!
   echo "[Bash]      Wait for Godot ready (PID $godotPid)..."
@@ -71,6 +78,28 @@ godotNotify() {
   fi
 
   $GODOT_BIN --headless --no-header --script ReloadOrchestrator.gd -- notify
+
+  echo "[Bash]      Wait for reload_extension() to enter, then release worker callback..."
+  local deadline=$((SECONDS + 10))
+  while [[ ! -f "$threadedStartedFile" ]]; do
+    if (( SECONDS >= deadline )); then
+      echo "[Bash]      Error: timed out waiting for threaded reload start marker."
+      exit 1
+    fi
+    sleep 0.02
+  done
+
+  # Leave a visible interval during which reload_extension() must be blocked in callback drain.
+  sleep 0.4
+  if [[ -f "$threadedCompletedFile" ]]; then
+    echo "[Bash]      Error: worker callback completed before explicit release."
+    exit 1
+  fi
+  if ! kill -0 "$godotPid" 2>/dev/null; then
+    echo "[Bash]      Error: Godot exited while reload should be waiting for callback drain."
+    exit 1
+  fi
+  touch "$threadedReleaseFile"
 
   echo "[Bash]      Wait for Godot exit..."
   local status=0
