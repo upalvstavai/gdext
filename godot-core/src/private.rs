@@ -6,8 +6,6 @@
  */
 
 use std::cell::Cell;
-#[cfg(safeguards_strict)]
-use std::cell::RefCell;
 use std::fmt::Display;
 use std::io::Write;
 use std::mem;
@@ -347,77 +345,60 @@ pub(crate) fn has_error_print_level(level: ErrorPrintLevel) -> bool {
     ERROR_PRINT_LEVEL.load() >= level
 }
 
-/// Internal type used to store context information for debug purposes. Debug context is stored on the thread-local
-/// ERROR_CONTEXT_STACK, which can later be used to retrieve the current context in the event of a panic. This value
-/// probably shouldn't be used directly; use [`fetch_last_panic_context()`] instead.
 #[cfg(safeguards_strict)]
-struct ScopedContextStack {
-    contexts: Vec<*const dyn Display>,
-}
-
+type PanicContextPtr = *const (dyn Display + 'static);
 #[cfg(safeguards_strict)]
-impl ScopedContextStack {
-    /// # Safety
-    /// Context must be removed (using [`Self::pop_context()`]) before lifetime is invalidated.
-    unsafe fn push_context<'a, 'b>(&'a mut self, context: &'b dyn Display) {
-        // SAFETY: Context has its lifetime `'b` extended to `'static` to satisfy the signature
-        // of `self.contexts` which has an implied `'static` bound.
-        // Given context must be removed before lifetime `'b` is invalidated.
-        let context = unsafe {
-            std::mem::transmute::<*const (dyn Display + 'b), *const (dyn Display + 'static)>(
-                context,
-            )
-        };
-
-        self.contexts.push(context);
-    }
-
-    fn pop_context(&mut self) {
-        self.contexts.pop().expect("context stack is empty!");
-    }
-
-    fn get_last(&self) -> Option<String> {
-        self.contexts.last().cloned().map(|pointer| {
-            // SAFETY:
-            // Invariants provided by push_context assert that any and all contexts held by ScopedContextStack
-            // are removed before they are invalidated; contexts must always be valid.
-            unsafe { (*pointer).to_string() }
-        })
-    }
-}
+type PreviousPanicContext = Option<PanicContextPtr>;
+#[cfg(not(safeguards_strict))]
+type PreviousPanicContext = ();
 
 #[cfg(safeguards_strict)]
 thread_local! {
-    static ERROR_CONTEXT_STACK: RefCell<ScopedContextStack> = const {
-        RefCell::new(ScopedContextStack { contexts: Vec::new() })
-    }
+    // Each nested `handle_panic` stack frame retains the previous pointer, so TLS only stores the
+    // current one. Keeping this slot no-drop is essential on foreign Godot worker threads: a TLS
+    // destructor may run after a hot-reloaded Linux cdylib has already been unloaded.
+    static ERROR_CONTEXT: Cell<Option<PanicContextPtr>> = const { Cell::new(None) };
 }
 
 /// Pushes the given context to the current thread's error context stack.
 /// # Safety
 /// Context must be removed (using [`pop_panic_context()`]) before its lifetime is invalidated.
-unsafe fn push_panic_context(error_context: &dyn Display) {
+unsafe fn push_panic_context(error_context: &dyn Display) -> PreviousPanicContext {
     #[cfg(not(safeguards_strict))]
-    let _ = error_context; // Unused in Release.
+    {
+        let _ = error_context; // Unused in Release.
+    }
 
     #[cfg(safeguards_strict)]
-    ERROR_CONTEXT_STACK.with(|cell| {
-        let mut stack = cell.borrow_mut();
-        // SAFETY: caller promises to pop error_context before its lifetime is invalidated.
-        unsafe { stack.push_context(error_context) }
-    });
+    {
+        // SAFETY: the caller promises to restore the previous pointer before `error_context`
+        // becomes invalid. The pointer is observed only synchronously on this thread.
+        let context = unsafe {
+            std::mem::transmute::<*const (dyn Display + '_), PanicContextPtr>(error_context)
+        };
+        ERROR_CONTEXT.with(|cell| cell.replace(Some(context)))
+    }
 }
 
 /// Pops a context from the current thread's error context stack.
-fn pop_panic_context() {
+fn pop_panic_context(previous: PreviousPanicContext) {
     #[cfg(safeguards_strict)]
-    ERROR_CONTEXT_STACK.with(|cell| cell.borrow_mut().pop_context());
+    ERROR_CONTEXT.with(|cell| cell.set(previous));
+
+    #[cfg(not(safeguards_strict))]
+    let _ = previous;
 }
 
 // Value may return `None`, even from panic hook, if called from a non-Godot thread.
 pub fn fetch_last_panic_context() -> Option<String> {
     #[cfg(safeguards_strict)]
-    return ERROR_CONTEXT_STACK.with(|cell| cell.borrow().get_last());
+    return ERROR_CONTEXT.with(|cell| {
+        cell.get().map(|pointer| {
+            // SAFETY: a non-null current pointer is installed only by `push_panic_context`, whose
+            // caller keeps the referenced context alive until the previous pointer is restored.
+            unsafe { (*pointer).to_string() }
+        })
+    });
 
     #[cfg(not(safeguards_strict))]
     None
@@ -456,11 +437,11 @@ where
     F: FnOnce() -> R + std::panic::UnwindSafe,
 {
     // SAFETY: &error_context is valid for lifetime of function, and is popped again before end of function.
-    unsafe { push_panic_context(error_context) };
+    let previous_context = unsafe { push_panic_context(error_context) };
 
     let result = std::panic::catch_unwind(code).map_err(PanicPayload::new);
 
-    pop_panic_context();
+    pop_panic_context(previous_context);
 
     result
 }
@@ -642,6 +623,8 @@ mod tests {
         CallError, OutCallGuard, PanicPayload, call_error_store, call_error_take,
         handle_fallible_ptrcall, handle_fallible_varcall,
     };
+    #[cfg(safeguards_strict)]
+    use super::{fetch_last_panic_context, handle_panic};
     use crate::meta::CallContext;
     use crate::meta::error::ConvertError;
     use crate::sys;
@@ -669,6 +652,31 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
         }
+    }
+
+    #[cfg(safeguards_strict)]
+    #[test]
+    fn panic_context_restores_nested_scope_without_heap_tls() {
+        assert!(!std::mem::needs_drop::<
+            std::cell::Cell<Option<super::PanicContextPtr>>,
+        >());
+
+        let outer = "outer context";
+        let inner = "inner context";
+
+        let outer_result = handle_panic(&outer, || {
+            assert_eq!(fetch_last_panic_context().as_deref(), Some(outer));
+
+            let inner_result = handle_panic(&inner, || {
+                assert_eq!(fetch_last_panic_context().as_deref(), Some(inner));
+                panic!("nested panic context probe");
+            });
+            assert!(inner_result.is_err());
+            assert_eq!(fetch_last_panic_context().as_deref(), Some(outer));
+        });
+
+        assert!(outer_result.is_ok());
+        assert!(fetch_last_panic_context().is_none());
     }
 
     #[test]
