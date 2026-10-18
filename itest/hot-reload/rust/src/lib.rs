@@ -157,7 +157,7 @@ impl ThreadedReloadProbe {
 /// a callback-admission race, while a detached Rust helper could outlive the dylib that contains
 /// its code.
 #[derive(GodotClass)]
-#[class(init, base=ResourceFormatLoader, unsafe_threaded)]
+#[class(init, tool, base=ResourceFormatLoader, unsafe_threaded)]
 struct ThreadedHotReloadLoader {
     base: Base<ResourceFormatLoader>,
 }

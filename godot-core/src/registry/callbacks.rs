@@ -718,7 +718,7 @@ where
 mod tests {
     #[test]
     fn every_ordinary_user_callback_enters_the_class_boundary() {
-        let source = include_str!("callbacks.rs");
+        let source = include_str!("callbacks.rs").replace("\r\n", "\n");
         let callback_names = [
             "create",
             "recreate",
@@ -757,7 +757,7 @@ mod tests {
 
     #[test]
     fn every_virtual_lookup_enters_the_lookup_boundary() {
-        let source = include_str!("callbacks.rs");
+        let source = include_str!("callbacks.rs").replace("\r\n", "\n");
 
         for name in ["get_virtual", "default_get_virtual"] {
             let needle = format!("pub unsafe extern \"C\" fn {name}<");

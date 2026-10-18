@@ -512,7 +512,7 @@ unsafe extern "C" fn ptrcall_callback<
 mod tests {
     #[test]
     fn method_callbacks_gate_before_reading_userdata() {
-        let source = include_str!("method.rs");
+        let source = include_str!("method.rs").replace("\r\n", "\n");
         let varcall_start = source
             .find("unsafe extern \"C\" fn varcall_callback<")
             .expect("varcall callback must exist");
