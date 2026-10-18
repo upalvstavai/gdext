@@ -152,6 +152,9 @@ pub enum ClassThreading {
 ///   before shutdown are drained, but a new worker callback beginning after worker admission closes violates this contract and is rejected
 ///   fail-stop before its body runs. Main-thread callbacks remain available for synchronous deinitialization cleanup until final binding
 ///   teardown;
+/// - account for the engine-owned operation after each callback returns. Draining admitted Rust trampolines does not join that host-side
+///   tail. Before the object or library can be released, either the operation must finish, or the engine contract must guarantee that its
+///   remaining tail cannot re-enter this extension, execute extension-owned code, or retain extension-owned data;
 /// - make dropping `Self` and every non-`Base<T>` field safe on any thread which can release the final storage claim. If Godot frees the
 ///   object during a worker, reference, or unreference callback, that callback may run `Drop`. Worker FFI permission is revoked before the
 ///   final claim drops, so `Drop` and field destructors must not access the base object, operate on Godot objects, or call Godot APIs.

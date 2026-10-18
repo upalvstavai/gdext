@@ -170,8 +170,9 @@ struct ThreadedHotReloadLoader {
 }
 
 // SAFETY: selected virtuals use synchronized Rust globals plus `std::fs`, and never access `base`
-// or another Godot object. The owner keeps this loader registered and strongly referenced until
-// the active request has drained and hot reload has completed. No field calls Godot from `Drop`.
+// or another Godot object. The owner keeps this loader registered and strongly referenced through
+// callback drain, hot reload, and the engine's subsequent request publication/cleanup, then
+// unregisters it before releasing the final reference. No field calls Godot from `Drop`.
 unsafe impl godot::obj::ThreadedGodotClass for ThreadedHotReloadLoader {}
 
 #[godot_api(unsafe_threaded)]

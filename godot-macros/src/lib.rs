@@ -692,7 +692,10 @@ use crate::util::{KvParser, bail, ident};
 /// field. Access to one instance moves between OS threads serially: while one thread holds any borrow, another thread waits even for a shared
 /// borrow. Do not wait for an operation that can dispatch another callback to the same instance while holding its receiver or a bind guard.
 /// The unsafe contract also covers generated argument/return-value marshalling, synchronous re-entry, destruction on the thread releasing the
-/// last storage claim, and quiescing callback dispatch before extension unload. See the safety documentation on
+/// last storage claim, and quiescing callback dispatch before extension unload. The owner must either drain each outstanding engine job
+/// through post-callback publication and cleanup, or establish from the engine contract that the remaining host-side tail is
+/// extension-independent and cannot re-enter after unload; waiting only for the currently executing Rust trampoline is insufficient by
+/// itself. See the safety documentation on
 /// [`ThreadedGodotClass`](../obj/trait.ThreadedGodotClass.html) before opting in.
 ///
 /// A non-`Base<T>` field which is not `Send` is rejected even when the unsafe trait is implemented:
@@ -726,8 +729,8 @@ use crate::util::{KvParser, bail, ident};
 ///
 /// // SAFETY: the overridden virtuals' complete ABIs are valid in ResourceLoader workers; they use only synchronized Rust state and worker-safe
 /// // value marshalling, never access `base` or another Godot object, and neither `WorkerLoader` nor its fields call Godot from `Drop`. The owner
-/// // retains its strong `Gd`, stops issuing loads, drains outstanding loads, unregisters the loader, and only then releases that final
-/// // reference; it also drains callbacks before extension deinitialization.
+/// // retains its strong `Gd`, stops issuing loads, drains each outstanding engine request through its post-callback publication and cleanup,
+/// // unregisters the loader, and only then releases that final reference; it also drains callbacks before extension deinitialization.
 /// unsafe impl godot::obj::ThreadedGodotClass for WorkerLoader {}
 ///
 /// #[godot_api(unsafe_threaded)]

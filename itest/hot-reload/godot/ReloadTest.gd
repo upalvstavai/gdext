@@ -41,7 +41,19 @@ func _ready() -> void:
 	r.free()
 
 	# Test construction from Rust (regression test for https://github.com/godot-rust/gdext/issues/543).
-	retained_obj = Reloadable.from_string("Mars")
+	var rust_constructed = Reloadable.from_string("Mars")
+	var rust_constructed_planet = rust_constructed.favorite_planet
+	rust_constructed.free()
+	if rust_constructed_planet != "Mars":
+		fail(str("Rust-constructed Reloadable did not retain its property (is ", rust_constructed_planet, ")"))
+		return
+
+	# Official Godot 4.2.0-4.2.2 does not track live objects constructed through
+	# object_set_instance() for hot reload (godotengine/godot#90085, fixed after 4.2.2 by
+	# godotengine/godot#90449 and in 4.3+). Keep that construction smoke test separate and retain
+	# a ClassDB-created object here so every supported engine actually recreates it.
+	retained_obj = Reloadable.new()
+	retained_obj.favorite_planet = "Mars"
 	var planet = retained_obj.favorite_planet
 	threaded_retained_obj = ThreadedReloadable.new()
 	threaded_retained_obj.marker = 451
@@ -155,8 +167,9 @@ func _process(delta: float) -> void:
 		return
 	print("[GD Editor] Hot reload waited ", reload_elapsed_msec, " ms for worker callback drain")
 
-	# Collect the pre-reload request first. Callback drain ends at the generated trampoline boundary,
-	# while Godot may still need a frame to publish the completed threaded-load token.
+	# Collect the pre-reload request first. The admission gate proves that unload waited for the
+	# extension callback. Godot may still need a frame to publish and clean up this specific
+	# ResourceLoader request; the framework cannot generally join arbitrary host-side task tails.
 	waiting_for_post_reload = true
 
 
