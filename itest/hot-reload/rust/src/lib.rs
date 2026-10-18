@@ -7,7 +7,6 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use godot::classes::{IResourceFormatLoader, Resource, ResourceFormatLoader};
@@ -98,7 +97,7 @@ impl ThreadedReloadable {
 const THREADED_RELOAD_EXTENSION: &str = "gdext_threaded_hot_reload";
 const THREADED_RELOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
-static THREADED_RELOAD_MAIN_THREAD: Mutex<Option<ThreadId>> = Mutex::new(None);
+static THREADED_RELOAD_MAIN_THREAD: Mutex<Option<usize>> = Mutex::new(None);
 static THREADED_RELOAD_RELEASE_PATH: Mutex<String> = Mutex::new(String::new());
 static THREADED_RELOAD_COMPLETED_PATH: Mutex<String> = Mutex::new(String::new());
 static THREADED_RELOAD_TIMEOUT_PATH: Mutex<String> = Mutex::new(String::new());
@@ -106,6 +105,14 @@ static THREADED_RELOAD_ARMED: AtomicBool = AtomicBool::new(false);
 static THREADED_RELOAD_ENTERED: AtomicBool = AtomicBool::new(false);
 static THREADED_RELOAD_LAST_CALLBACK_WAS_WORKER: AtomicBool = AtomicBool::new(false);
 static THREADED_RELOAD_LOAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn current_thread_id() -> usize {
+    thread_local! {
+        static CURRENT_THREAD_MARKER: u8 = const { 0 };
+    }
+
+    CURRENT_THREAD_MARKER.with(|marker| marker as *const u8 as usize)
+}
 
 #[derive(GodotClass)]
 #[class(no_init, base=Object)]
@@ -115,7 +122,7 @@ struct ThreadedReloadProbe;
 impl ThreadedReloadProbe {
     #[func]
     fn arm_gate(release_path: GString, completed_path: GString, timeout_path: GString) {
-        *THREADED_RELOAD_MAIN_THREAD.lock().unwrap() = Some(std::thread::current().id());
+        *THREADED_RELOAD_MAIN_THREAD.lock().unwrap() = Some(current_thread_id());
         *THREADED_RELOAD_RELEASE_PATH.lock().unwrap() = release_path.to_string();
         *THREADED_RELOAD_COMPLETED_PATH.lock().unwrap() = completed_path.to_string();
         *THREADED_RELOAD_TIMEOUT_PATH.lock().unwrap() = timeout_path.to_string();
@@ -127,7 +134,7 @@ impl ThreadedReloadProbe {
 
     #[func]
     fn arm_open_probe() {
-        *THREADED_RELOAD_MAIN_THREAD.lock().unwrap() = Some(std::thread::current().id());
+        *THREADED_RELOAD_MAIN_THREAD.lock().unwrap() = Some(current_thread_id());
         THREADED_RELOAD_ENTERED.store(false, Ordering::SeqCst);
         THREADED_RELOAD_LAST_CALLBACK_WAS_WORKER.store(false, Ordering::SeqCst);
         THREADED_RELOAD_LOAD_COUNT.store(0, Ordering::SeqCst);
@@ -190,7 +197,7 @@ impl IResourceFormatLoader for ThreadedHotReloadLoader {
 
         let main_thread = *THREADED_RELOAD_MAIN_THREAD.lock().unwrap();
         THREADED_RELOAD_LAST_CALLBACK_WAS_WORKER.store(
-            main_thread.is_some_and(|main| main != std::thread::current().id()),
+            main_thread.is_some_and(|main| main != current_thread_id()),
             Ordering::SeqCst,
         );
 

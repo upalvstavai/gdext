@@ -33,9 +33,9 @@ threadedTimeoutFile="$PWD/.threaded_reload_timeout"
 cleanup() {
   if [[ $cleanedUp -eq 0 ]]; then
     cleanedUp=1
-    if [[ $godotPid -ne 0 ]]; then
+    if [[ $godotPid -ne 0 ]] && kill -0 "$godotPid" 2>/dev/null; then
       echo "[Bash]      Kill Godot (PID $godotPid)..."
-      kill $godotPid || true # ignore errors here
+      kill "$godotPid" || true # ignore errors here
     fi
     echo "[Bash]      Cleanup..."
     rm -f "$threadedReleaseFile" "$threadedStartedFile" "$threadedCompletedFile" "$threadedTimeoutFile"
@@ -103,8 +103,11 @@ godotNotify() {
 
   echo "[Bash]      Wait for Godot exit..."
   local status=0
-  wait $godotPid
-  status=$?
+  if wait "$godotPid"; then
+    status=0
+  else
+    status=$?
+  fi
   echo "[Bash]      Godot (PID $godotPid) has completed with status $status."
   godotPid=0
 

@@ -8,6 +8,7 @@
 use std::error::Error;
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+#[cfg(test)]
 use std::thread;
 
 use crate::blocking_guards::{InaccessibleGuardBlocking, MutGuardBlocking, RefGuardBlocking};
@@ -194,12 +195,12 @@ pub(crate) struct ThreadTracker {
     /// This is not an Option, contrary to what one might expect. Making this an option would require reliable knowledge that not a single
     /// MutGuardBlocking exists before setting it to None. This would require tracking a count of mutable borrows. Instead, we always set
     /// the field to an acceptable value and avoid the overhead.
-    mut_thread: thread::ThreadId,
+    mut_thread: usize,
 
     /// Shared-reference count per thread.
     ///
     /// `Vec` instead of `HashMap`: #threads concurrently holding a shared borrow on a cell is almost always 0 or 1, so linear search is cheaper.
-    shared_counts: Vec<(thread::ThreadId, usize)>,
+    shared_counts: Vec<(usize, usize)>,
 }
 
 impl Default for ThreadTracker {
@@ -211,13 +212,17 @@ impl Default for ThreadTracker {
     }
 }
 
-/// Same as `godot_ffi::current_thread_id()`, duplicated to keep this crate dependency-free.
-fn current_thread_id() -> thread::ThreadId {
+/// Destructor-free thread identity, duplicated here to keep this crate dependency-free.
+///
+/// `std::thread::current()` installs Rust runtime thread cleanup on foreign worker threads. That
+/// cleanup can outlive a hot-reloaded cdylib on Linux. A const no-drop TLS marker has a stable,
+/// unique address for each live thread without registering a destructor.
+fn current_thread_id() -> usize {
     thread_local! {
-        static CURRENT_THREAD_ID: thread::ThreadId = thread::current().id();
+        static CURRENT_THREAD_MARKER: u8 = const { 0 };
     }
 
-    CURRENT_THREAD_ID.with(|id| *id)
+    CURRENT_THREAD_MARKER.with(|marker| marker as *const u8 as usize)
 }
 
 impl ThreadTracker {
@@ -272,7 +277,7 @@ impl ThreadTracker {
         self.mut_thread == current_thread_id()
     }
 
-    fn find_shared_count(&mut self, thread_id: thread::ThreadId) -> Option<&mut usize> {
+    fn find_shared_count(&mut self, thread_id: usize) -> Option<&mut usize> {
         self.shared_counts
             .iter_mut()
             .find(|(id, _)| *id == thread_id)

@@ -10,7 +10,7 @@ use std::sync::{
     Condvar as CallbackCondvar, Mutex as CallbackMutex, MutexGuard as CallbackMutexGuard,
 };
 #[cfg(all(not(loom), not(wasm_nothreads)))]
-use std::thread::ThreadId as CallbackThreadId;
+type CallbackThreadId = usize;
 
 #[cfg(loom)]
 use loom::sync::{
@@ -34,9 +34,18 @@ fn current_callback_thread_id() -> CallbackThreadId {
     loom::thread::current().id()
 }
 
+// A const-initialized, no-drop TLS marker avoids `std::thread::current()`. The latter installs a
+// Rust runtime cleanup guard on foreign worker threads; on Linux that guard can run after a
+// hot-reloaded cdylib has been unloaded. The address remains unique and stable for each live thread
+// within one loaded extension lifecycle, which is all callback admission needs.
+#[cfg(all(not(loom), not(wasm_nothreads)))]
+thread_local! {
+    static CALLBACK_THREAD_MARKER: u8 = const { 0 };
+}
+
 #[cfg(all(not(loom), not(wasm_nothreads)))]
 fn current_callback_thread_id() -> CallbackThreadId {
-    crate::current_thread_id()
+    CALLBACK_THREAD_MARKER.with(|marker| marker as *const u8 as usize)
 }
 
 #[cfg(all(not(loom), wasm_nothreads))]
