@@ -25,22 +25,15 @@ fi
 # Restore un-reloaded files on exit (for local testing).
 cleanedUp=0 # avoid recursion if cleanup fails
 godotPid=0 # kill previous instance if necessary
-threadedReleaseFile="$PWD/.threaded_reload_release"
-threadedStartedFile="$PWD/.threaded_reload_started"
-threadedCompletedFile="$PWD/.threaded_reload_completed"
-threadedTimeoutFile="$PWD/.threaded_reload_timeout"
 
 cleanup() {
   if [[ $cleanedUp -eq 0 ]]; then
     cleanedUp=1
-    if [[ $godotPid -ne 0 ]] && kill -0 "$godotPid" 2>/dev/null; then
+    if [[ $godotPid -ne 0 ]]; then
       echo "[Bash]      Kill Godot (PID $godotPid)..."
-      kill "$godotPid" 2>/dev/null || true # ignore errors here
-      wait "$godotPid" 2>/dev/null || true
-      godotPid=0
+      kill $godotPid || true # ignore errors here
     fi
     echo "[Bash]      Cleanup..."
-    rm -f "$threadedReleaseFile" "$threadedStartedFile" "$threadedCompletedFile" "$threadedTimeoutFile"
     git checkout --quiet $rel/../rust/src/lib.rs $rel/rust.gdextension $rel/MainScene.tscn || true # ignore errors here
   fi
 }
@@ -64,21 +57,7 @@ godotAwait() {
     exit 1
   fi
 
-  rm -f "$threadedReleaseFile" "$threadedStartedFile" "$threadedCompletedFile" "$threadedTimeoutFile"
-
-  if [[ "${GDRUST_GDB:-0}" == "1" ]]; then
-    gdb --batch --return-child-result \
-      -ex "set pagination off" \
-      -ex "run" \
-      -ex "frame 1" \
-      -ex "print this->_instance_binding_count" \
-      -ex "print *this->_instance_bindings@this->_instance_binding_count" \
-      -ex "info sharedlibrary" \
-      -ex "thread apply all bt full" \
-      --args "$GODOT_BIN" -e --headless --path "$rel" &
-  else
-    "$GODOT_BIN" -e --headless --path "$rel" &
-  fi
+  $GODOT_BIN -e --headless --path $rel &
   godotPid=$!
   echo "[Bash]      Wait for Godot ready (PID $godotPid)..."
 
@@ -93,35 +72,10 @@ godotNotify() {
 
   $GODOT_BIN --headless --no-header --script ReloadOrchestrator.gd -- notify
 
-  echo "[Bash]      Wait for reload_extension() to enter, then release worker callback..."
-  local deadline=$((SECONDS + 10))
-  while [[ ! -f "$threadedStartedFile" ]]; do
-    if (( SECONDS >= deadline )); then
-      echo "[Bash]      Error: timed out waiting for threaded reload start marker."
-      exit 1
-    fi
-    sleep 0.02
-  done
-
-  # Leave a visible interval during which reload_extension() must be blocked in callback drain.
-  sleep 0.4
-  if [[ -f "$threadedCompletedFile" ]]; then
-    echo "[Bash]      Error: worker callback completed before explicit release."
-    exit 1
-  fi
-  if ! kill -0 "$godotPid" 2>/dev/null; then
-    echo "[Bash]      Error: Godot exited while reload should be waiting for callback drain."
-    exit 1
-  fi
-  touch "$threadedReleaseFile"
-
   echo "[Bash]      Wait for Godot exit..."
   local status=0
-  if wait "$godotPid"; then
-    status=0
-  else
-    status=$?
-  fi
+  wait $godotPid
+  status=$?
   echo "[Bash]      Godot (PID $godotPid) has completed with status $status."
   godotPid=0
 

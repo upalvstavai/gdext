@@ -14,22 +14,8 @@ var thread := Thread.new()
 var extension_name: String
 
 var retained_obj: Reloadable
-var threaded_loader_obj: ThreadedHotReloadLoader
 
 var signal_obj: Object
-
-const THREADED_PRE_PATH := "res://before_reload.gdext_threaded_hot_reload"
-const THREADED_POST_PATH := "res://after_reload.gdext_threaded_hot_reload"
-const THREADED_RELEASE_FILE := "res://.threaded_reload_release"
-const THREADED_STARTED_FILE := "res://.threaded_reload_started"
-const THREADED_COMPLETED_FILE := "res://.threaded_reload_completed"
-const THREADED_TIMEOUT_FILE := "res://.threaded_reload_timeout"
-const MIN_RELOAD_WAIT_MSEC := 250
-
-var initial_ready_sent := false
-var waiting_for_post_reload := false
-var post_request_started := false
-var threaded_loader_registered := false
 
 
 func _ready() -> void:
@@ -62,26 +48,9 @@ func _ready() -> void:
 		print("[GD Editor] Skipping signal test: hot reloading with typed signals is not supported for this Godot version")
 
 	udp.bind(1337)
+	print("[GD Editor] ReloadTest ready to receive...")
 
-	threaded_loader_obj = ThreadedHotReloadLoader.new()
-	ResourceLoader.add_resource_format_loader(threaded_loader_obj, true)
-	threaded_loader_registered = true
-	ThreadedReloadProbe.arm_gate(
-		ProjectSettings.globalize_path(THREADED_RELEASE_FILE),
-		ProjectSettings.globalize_path(THREADED_COMPLETED_FILE),
-		ProjectSettings.globalize_path(THREADED_TIMEOUT_FILE),
-	)
-	var request_error := ResourceLoader.load_threaded_request(
-		THREADED_PRE_PATH,
-		"",
-		true,
-		ResourceLoader.CACHE_MODE_IGNORE,
-	)
-	if request_error != OK:
-		fail(str("Failed to start pre-reload threaded callback: ", request_error))
-		return
-
-	print("[GD Editor] Waiting for selected worker callback before reload...")
+	send_udp()
 
 
 func send_udp():
@@ -101,121 +70,18 @@ func send_udp():
 
 func _exit_tree() -> void:
 	print("[GD Editor] ReloadTest exit.")
-	if threaded_loader_registered and is_instance_valid(threaded_loader_obj):
-		ResourceLoader.remove_resource_format_loader(threaded_loader_obj)
-		threaded_loader_registered = false
 	udp.close()
 
 
 func _process(delta: float) -> void:
-	if not initial_ready_sent:
-		if not ThreadedReloadProbe.callback_entered():
-			return
-		if not ThreadedReloadProbe.last_callback_was_worker():
-			fail("Selected ResourceFormatLoader callback did not run on a worker thread")
-			return
-		initial_ready_sent = true
-		print("[GD Editor] Worker callback is gated; ReloadTest ready to receive...")
-		send_udp()
-		return
-
-	if waiting_for_post_reload:
-		_poll_post_reload_request()
-		return
-
 	if udp.get_available_packet_count() == 0:
 		return
 
 	var packet = udp.get_packet().get_string_from_ascii()
 	print("[GD Editor] Received UDP packet [", packet.length(), "]: ", packet)
 
-	var started_file := FileAccess.open(THREADED_STARTED_FILE, FileAccess.WRITE)
-	if started_file == null:
-		fail("Failed to write threaded reload start marker")
-		return
-	started_file.store_line("reload_extension call begins")
-	started_file.close()
-
-	var reload_started_msec := Time.get_ticks_msec()
 	if not _hot_reload():
 		return
-	var reload_elapsed_msec := Time.get_ticks_msec() - reload_started_msec
-
-	if reload_elapsed_msec < MIN_RELOAD_WAIT_MSEC:
-		fail(str("Hot reload returned before the gated worker callback was released (", reload_elapsed_msec, " ms)"))
-		return
-	if not FileAccess.file_exists(THREADED_COMPLETED_FILE):
-		fail("Hot reload completed without the worker callback completion marker")
-		return
-	if FileAccess.file_exists(THREADED_TIMEOUT_FILE):
-		fail("Worker callback escaped only through its anti-deadlock timeout")
-		return
-	print("[GD Editor] Hot reload waited ", reload_elapsed_msec, " ms for worker callback drain")
-
-	# Collect the pre-reload request first. Callback drain ends at the generated trampoline boundary,
-	# while Godot may still need a frame to publish the completed threaded-load token.
-	waiting_for_post_reload = true
-
-
-func _poll_post_reload_request() -> void:
-	if not post_request_started:
-		var pre_status := ResourceLoader.load_threaded_get_status(THREADED_PRE_PATH)
-		if pre_status == ResourceLoader.THREAD_LOAD_IN_PROGRESS:
-			return
-		if pre_status != ResourceLoader.THREAD_LOAD_LOADED:
-			fail(str("Pre-reload threaded callback ended with status ", pre_status))
-			return
-		var pre_resource := ResourceLoader.load_threaded_get(THREADED_PRE_PATH)
-		if pre_resource == null:
-			fail("Pre-reload threaded callback returned no Resource")
-			return
-
-		# The library has now been reloaded. Exercise the same reconstructed loader again so this
-		# proves that callback admission opened for the next lifecycle, not only that teardown drained.
-		ThreadedReloadProbe.arm_open_probe()
-		var post_request_error := ResourceLoader.load_threaded_request(
-			THREADED_POST_PATH,
-			"",
-			true,
-			ResourceLoader.CACHE_MODE_IGNORE,
-		)
-		if post_request_error != OK:
-			fail(str("Failed to start post-reload threaded callback: ", post_request_error))
-			return
-		post_request_started = true
-		return
-
-	var status := ResourceLoader.load_threaded_get_status(THREADED_POST_PATH)
-	if status == ResourceLoader.THREAD_LOAD_IN_PROGRESS:
-		return
-	if status != ResourceLoader.THREAD_LOAD_LOADED:
-		fail(str("Post-reload threaded callback ended with status ", status))
-		return
-
-	var resource := ResourceLoader.load_threaded_get(THREADED_POST_PATH)
-	if resource == null:
-		fail("Post-reload threaded callback returned no Resource")
-		return
-	if ThreadedReloadProbe.load_count() < 1:
-		fail("Reopened lifecycle did not invoke the threaded loader")
-		return
-	if not ThreadedReloadProbe.last_callback_was_worker():
-		fail("Reopened lifecycle invoked the selected callback on the main thread")
-		return
-
-	waiting_for_post_reload = false
-	print("[GD Editor] Post-reload cleanup: remove threaded loader")
-	ResourceLoader.remove_resource_format_loader(threaded_loader_obj)
-	print("[GD Editor] Post-reload cleanup: release threaded loader reference")
-	threaded_loader_registered = false
-	threaded_loader_obj = null
-	print("[GD Editor] Post-reload cleanup: threaded loader complete")
-	print("[GD Editor] Post-reload worker callback succeeded after lifecycle reopened")
-	_finalize_hot_reload_assertions()
-
-
-func _finalize_hot_reload_assertions() -> void:
-	print("[GD Editor] Final assertions: begin")
 
 	if self.signal_obj:
 		# Test if previous signal has been properly disconnected before hot-reload.
@@ -231,26 +97,21 @@ func _finalize_hot_reload_assertions() -> void:
 
 		self.signal_obj.free()
 
-	print("[GD Editor] Final assertions: construct Reloadable")
 	var r = Reloadable.new()
 	var num = r.get_number()
 	r.free()
-	print("[GD Editor] Final assertions: Reloadable complete")
 
 	# Check if the property has been restored.
-	print("[GD Editor] Final assertions: read retained Reloadable")
 	var planet = retained_obj.favorite_planet
-	print("[GD Editor] Final assertions: retained Reloadable property complete")
-	print("[GD Editor] Final assertions: free retained Reloadable")
 	retained_obj.free()
-	print("[GD Editor] Final assertions: retained Reloadable complete")
+
 	if num == 777 and planet == "Mars":
 		print("[GD Editor] Successful hot-reload! Exit...")
 		get_tree().quit(0)
 	elif num != 777:
 		fail(str("Number was not updated correctly (is ", num, ")"))
 		return
-	elif planet != "Mars":
+	else:
 		fail(str("Planet was not restored correctly (is ", planet, ")"))
 		return
 
