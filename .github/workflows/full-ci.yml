@@ -552,6 +552,11 @@ jobs:
       - name: "Patch prebuilt version"
         run: .github/other/patch-prebuilt.sh 4.2
 
+      - name: "Install debugger"
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gdb
+
       - name: "Build and test hot-reload"
         working-directory: itest/hot-reload/godot
         env:
