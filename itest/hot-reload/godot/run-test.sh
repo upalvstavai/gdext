@@ -66,7 +66,15 @@ godotAwait() {
 
   rm -f "$threadedReleaseFile" "$threadedStartedFile" "$threadedCompletedFile" "$threadedTimeoutFile"
 
-  $GODOT_BIN -e --headless --path $rel &
+  if [[ "${GDRUST_GDB:-0}" == "1" ]]; then
+    gdb --batch --return-child-result \
+      -ex "set pagination off" \
+      -ex "run" \
+      -ex "thread apply all bt full" \
+      --args "$GODOT_BIN" -e --headless --path "$rel" &
+  else
+    "$GODOT_BIN" -e --headless --path "$rel" &
+  fi
   godotPid=$!
   echo "[Bash]      Wait for Godot ready (PID $godotPid)..."
 

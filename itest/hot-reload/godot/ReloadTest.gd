@@ -207,9 +207,12 @@ func _poll_post_reload_request() -> void:
 		return
 
 	waiting_for_post_reload = false
+	print("[GD Editor] Post-reload cleanup: remove threaded loader")
 	ResourceLoader.remove_resource_format_loader(threaded_loader_obj)
+	print("[GD Editor] Post-reload cleanup: release threaded loader reference")
 	threaded_loader_registered = false
 	threaded_loader_obj = null
+	print("[GD Editor] Post-reload cleanup: threaded loader complete")
 	print("[GD Editor] Post-reload worker callback succeeded after lifecycle reopened")
 	_finalize_hot_reload_assertions()
 
@@ -240,6 +243,8 @@ func _finalize_hot_reload_assertions() -> void:
 	# Check if the property has been restored.
 	print("[GD Editor] Final assertions: read retained Reloadable")
 	var planet = retained_obj.favorite_planet
+	print("[GD Editor] Final assertions: retained Reloadable property complete")
+	print("[GD Editor] Final assertions: free retained Reloadable")
 	retained_obj.free()
 	print("[GD Editor] Final assertions: retained Reloadable complete")
 	print("[GD Editor] Final assertions: read threaded marker")

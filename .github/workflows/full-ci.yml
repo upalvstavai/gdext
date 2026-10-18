@@ -554,6 +554,8 @@ jobs:
 
       - name: "Build and test hot-reload"
         working-directory: itest/hot-reload/godot
+        env:
+          GDRUST_GDB: 1
         run: ./run-test.sh api-4-2
 
   cargo-deny-machete:
