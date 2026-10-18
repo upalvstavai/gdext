@@ -11,6 +11,15 @@ on:
   # Allow manually triggering the workflow:
   # https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch
   workflow_dispatch:
+    inputs:
+      focused-test:
+        description: "Run one focused diagnostic instead of the full matrix"
+        required: false
+        type: choice
+        default: full
+        options:
+          - full
+          - threaded-hot-reload-4.2
   merge_group:
 #  push:
 
@@ -40,6 +49,7 @@ defaults:
 jobs:
   # Keep all in sync with minimal-ci and release-version.
   rustfmt:
+    if: inputs.focused-test != 'threaded-hot-reload-4.2'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -67,6 +77,7 @@ jobs:
 
   # Needs to be its own job (apart from sync-doc), because lints don't work with --no-deps, and because it contributes to ci-status.
   doc-lints:
+    if: inputs.focused-test != 'threaded-hot-reload-4.2'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -87,6 +98,7 @@ jobs:
         run: cargo doc -p godot --ignore-rust-version
 
   clippy:
+    if: inputs.focused-test != 'threaded-hot-reload-4.2'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -113,6 +125,7 @@ jobs:
           -D warnings
 
   unit-test:
+    if: inputs.focused-test != 'threaded-hot-reload-4.2'
     name: unit-test (${{ matrix.name }}${{ matrix.rust-special }})
     runs-on: ${{ matrix.os }}
     continue-on-error: false
@@ -186,6 +199,7 @@ jobs:
           cargo test -p godot-core --lib --release --features safeguards-release-disengaged concrete_storage_layout_preserves_single_threaded_baseline
 
   unit-test-web:
+    if: inputs.focused-test != 'threaded-hot-reload-4.2'
     name: unit-test-web (${{ matrix.name }})
     runs-on: ubuntu-24.04
     strategy:
@@ -224,6 +238,7 @@ jobs:
         run: ./check.sh ${{ matrix.command }}
 
   miri-test:
+    if: inputs.focused-test != 'threaded-hot-reload-4.2'
     name: miri-test
     runs-on: ubuntu-24.04
     steps:
@@ -249,6 +264,7 @@ jobs:
 
   # For complex matrix workflow, see https://stackoverflow.com/a/65434401
   godot-itest:
+    if: inputs.focused-test != 'threaded-hot-reload-4.2'
     name: godot-itest (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     continue-on-error: false
@@ -517,7 +533,31 @@ jobs:
         run: $RETRY ./run-test.sh ${{ matrix.hot-reload }}
         shell: bash
 
+  threaded-hot-reload-4-2-diagnostic:
+    if: inputs.focused-test == 'threaded-hot-reload-4.2'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: "Install Godot"
+        uses: ./.github/composite/godot-install
+        with:
+          artifact-name: godot-linux-4.2
+          godot-binary: godot.linuxbsd.editor.dev.x86_64
+
+      - name: "Install Rust"
+        uses: ./.github/composite/rust
+
+      - name: "Patch prebuilt version"
+        run: .github/other/patch-prebuilt.sh 4.2
+
+      - name: "Build and test hot-reload"
+        working-directory: itest/hot-reload/godot
+        run: ./run-test.sh api-4-2
+
   cargo-deny-machete:
+    if: inputs.focused-test != 'threaded-hot-reload-4.2'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -543,6 +583,7 @@ jobs:
         run: cargo machete
 
   license-guard:
+    if: inputs.focused-test != 'threaded-hot-reload-4.2'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
