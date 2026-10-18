@@ -5,13 +5,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crate::{
-    BuiltinLifecycleTable, BuiltinMethodTable, ClassCoreMethodTable, ClassEditorMethodTable,
-    ClassSceneMethodTable, ClassServersMethodTable, GDExtensionClassLibraryPtr,
-    GDExtensionConstTypePtr, GDExtensionInterface, GDExtensionTypePtr,
-    GDExtensionUninitializedTypePtr, GDExtensionUninitializedVariantPtr, GDExtensionVariantPtr,
-    GdextRuntimeMetadata, ManualInitCell, UtilityFunctionTable,
+#[cfg(not(loom))]
+use std::sync::{
+    Condvar as CallbackCondvar, Mutex as CallbackMutex, MutexGuard as CallbackMutexGuard,
 };
+#[cfg(all(not(loom), not(wasm_nothreads)))]
+use std::thread::ThreadId as CallbackThreadId;
 
 #[cfg(loom)]
 use loom::sync::{
@@ -19,12 +18,14 @@ use loom::sync::{
 };
 #[cfg(loom)]
 use loom::thread::ThreadId as CallbackThreadId;
-#[cfg(not(loom))]
-use std::sync::{
-    Condvar as CallbackCondvar, Mutex as CallbackMutex, MutexGuard as CallbackMutexGuard,
+
+use crate::{
+    BuiltinLifecycleTable, BuiltinMethodTable, ClassCoreMethodTable, ClassEditorMethodTable,
+    ClassSceneMethodTable, ClassServersMethodTable, GDExtensionClassLibraryPtr,
+    GDExtensionConstTypePtr, GDExtensionInterface, GDExtensionTypePtr,
+    GDExtensionUninitializedTypePtr, GDExtensionUninitializedVariantPtr, GDExtensionVariantPtr,
+    GdextRuntimeMetadata, ManualInitCell, UtilityFunctionTable,
 };
-#[cfg(all(not(loom), not(wasm_nothreads)))]
-use std::thread::ThreadId as CallbackThreadId;
 #[cfg(all(not(loom), wasm_nothreads))]
 type CallbackThreadId = ();
 
