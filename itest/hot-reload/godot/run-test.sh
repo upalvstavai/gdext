@@ -70,6 +70,10 @@ godotAwait() {
     gdb --batch --return-child-result \
       -ex "set pagination off" \
       -ex "run" \
+      -ex "frame 1" \
+      -ex "print this->_instance_binding_count" \
+      -ex "print *this->_instance_bindings@this->_instance_binding_count" \
+      -ex "info sharedlibrary" \
       -ex "thread apply all bt full" \
       --args "$GODOT_BIN" -e --headless --path "$rel" &
   else
