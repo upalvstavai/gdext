@@ -1,0 +1,39 @@
+# Copyright (c) godot-rust; Bromeon and contributors.
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: Threaded hot-reload 4.2 diagnostic
+
+on:
+  workflow_dispatch:
+
+env:
+  RETRY: ${{ github.workspace }}/.github/other/retry.sh
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux-4-2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: "Install Godot"
+        uses: ./.github/composite/godot-install
+        with:
+          artifact-name: godot-linux-4.2
+          godot-binary: godot.linuxbsd.editor.dev.x86_64
+
+      - name: "Install Rust"
+        uses: ./.github/composite/rust
+
+      - name: "Patch prebuilt version"
+        run: .github/other/patch-prebuilt.sh 4.2
+
+      - name: "Build and test hot-reload"
+        working-directory: itest/hot-reload/godot
+        run: ./run-test.sh api-4-2

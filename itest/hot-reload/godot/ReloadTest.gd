@@ -215,6 +215,7 @@ func _poll_post_reload_request() -> void:
 
 
 func _finalize_hot_reload_assertions() -> void:
+	print("[GD Editor] Final assertions: begin")
 
 	if self.signal_obj:
 		# Test if previous signal has been properly disconnected before hot-reload.
@@ -230,16 +231,24 @@ func _finalize_hot_reload_assertions() -> void:
 
 		self.signal_obj.free()
 
+	print("[GD Editor] Final assertions: construct Reloadable")
 	var r = Reloadable.new()
 	var num = r.get_number()
 	r.free()
+	print("[GD Editor] Final assertions: Reloadable complete")
 
 	# Check if the property has been restored.
+	print("[GD Editor] Final assertions: read retained Reloadable")
 	var planet = retained_obj.favorite_planet
 	retained_obj.free()
+	print("[GD Editor] Final assertions: retained Reloadable complete")
+	print("[GD Editor] Final assertions: read threaded marker")
 	var threaded_marker = threaded_retained_obj.marker
+	print("[GD Editor] Final assertions: call threaded method")
 	var threaded_double = threaded_retained_obj.doubled_marker()
+	print("[GD Editor] Final assertions: free threaded object")
 	threaded_retained_obj.free()
+	print("[GD Editor] Final assertions: threaded object complete")
 
 	if num == 777 and planet == "Mars" and threaded_marker == 451 and threaded_double == 902:
 		print("[GD Editor] Successful hot-reload! Exit...")
