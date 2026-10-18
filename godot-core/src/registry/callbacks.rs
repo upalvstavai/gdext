@@ -255,11 +255,20 @@ where
     )?;
 
     let binding_data_callbacks = crate::storage::nop_instance_callbacks();
+    let library = unsafe { sys::get_library() };
+    let binding_free_callback = binding_data_callbacks
+        .free_callback
+        .map(|callback| callback as *const ())
+        .unwrap_or(std::ptr::null());
+    eprintln!(
+        "[Rust binding debug] set class={} object={base_ptr:p} instance={instance_ptr:p} library={library:p} free={binding_free_callback:p}",
+        std::any::type_name::<T>(),
+    );
     unsafe {
         interface_fn!(object_set_instance)(base_ptr, class_id.string_sys(), instance_ptr);
         interface_fn!(object_set_instance_binding)(
             base_ptr,
-            sys::get_library() as *mut std::ffi::c_void,
+            library as *mut std::ffi::c_void,
             instance_ptr as *mut std::ffi::c_void,
             &binding_data_callbacks,
         );
@@ -296,6 +305,10 @@ pub unsafe extern "C" fn free<T: GodotClass>(
     _class_user_data: *mut std::ffi::c_void,
     instance: sys::GDExtensionClassInstancePtr,
 ) {
+    eprintln!(
+        "[Rust binding debug] free class={} instance={instance:p}",
+        std::any::type_name::<T>(),
+    );
     match T::__THREADING {
         ClassThreading::SingleThreaded => {
             // SAFETY: pointer is valid for the callback duration (Godot contract), and this callback is confined to the binding thread.
