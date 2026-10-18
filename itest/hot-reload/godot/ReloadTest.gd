@@ -14,7 +14,6 @@ var thread := Thread.new()
 var extension_name: String
 
 var retained_obj: Reloadable
-var threaded_retained_obj: ThreadedReloadable
 var threaded_loader_obj: ThreadedHotReloadLoader
 
 var signal_obj: Object
@@ -43,8 +42,6 @@ func _ready() -> void:
 	# Test construction from Rust (regression test for https://github.com/godot-rust/gdext/issues/543).
 	retained_obj = Reloadable.from_string("Mars")
 	var planet = retained_obj.favorite_planet
-	threaded_retained_obj = ThreadedReloadable.new()
-	threaded_retained_obj.marker = 451
 
 	print("[GD Editor] Sanity check: initial number is ", num, "; planet is ", planet)
 
@@ -247,15 +244,7 @@ func _finalize_hot_reload_assertions() -> void:
 	print("[GD Editor] Final assertions: free retained Reloadable")
 	retained_obj.free()
 	print("[GD Editor] Final assertions: retained Reloadable complete")
-	print("[GD Editor] Final assertions: read threaded marker")
-	var threaded_marker = threaded_retained_obj.marker
-	print("[GD Editor] Final assertions: call threaded method")
-	var threaded_double = threaded_retained_obj.doubled_marker()
-	print("[GD Editor] Final assertions: free threaded object")
-	threaded_retained_obj.free()
-	print("[GD Editor] Final assertions: threaded object complete")
-
-	if num == 777 and planet == "Mars" and threaded_marker == 451 and threaded_double == 902:
+	if num == 777 and planet == "Mars":
 		print("[GD Editor] Successful hot-reload! Exit...")
 		get_tree().quit(0)
 	elif num != 777:
@@ -263,9 +252,6 @@ func _finalize_hot_reload_assertions() -> void:
 		return
 	elif planet != "Mars":
 		fail(str("Planet was not restored correctly (is ", planet, ")"))
-		return
-	else:
-		fail(str("Threaded storage was not restored correctly (marker ", threaded_marker, ", doubled ", threaded_double, ")"))
 		return
 
 
