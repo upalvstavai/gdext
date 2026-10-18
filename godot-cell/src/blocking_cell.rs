@@ -7,6 +7,7 @@
 
 use std::error::Error;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 #[cfg(test)]
 use std::thread;
@@ -212,17 +213,44 @@ impl Default for ThreadTracker {
     }
 }
 
+static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(1);
+
 /// Destructor-free thread identity, duplicated here to keep this crate dependency-free.
 ///
 /// `std::thread::current()` installs Rust runtime thread cleanup on foreign worker threads. That
-/// cleanup can outlive a hot-reloaded cdylib on Linux. A const no-drop TLS marker has a stable,
-/// unique address for each live thread without registering a destructor.
+/// cleanup can outlive a hot-reloaded cdylib on Linux. A const no-drop TLS cell and monotonic
+/// loaded-extension-lifetime IDs avoid both destructor registration and identity reuse after a
+/// thread exits.
 fn current_thread_id() -> usize {
     thread_local! {
-        static CURRENT_THREAD_MARKER: u8 = const { 0 };
+        static CURRENT_THREAD_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    CURRENT_THREAD_MARKER.with(|marker| marker as *const u8 as usize)
+    CURRENT_THREAD_ID.with(|thread_id| {
+        let existing = thread_id.get();
+        if existing != 0 {
+            return existing;
+        }
+
+        let mut next = NEXT_THREAD_ID.load(Ordering::Relaxed);
+        let assigned = loop {
+            let following = next
+                .checked_add(1)
+                .unwrap_or_else(|| panic!("exhausted destructor-free thread identities"));
+
+            match NEXT_THREAD_ID.compare_exchange_weak(
+                next,
+                following,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break next,
+                Err(actual) => next = actual,
+            }
+        };
+        thread_id.set(assigned);
+        assigned
+    })
 }
 
 impl ThreadTracker {

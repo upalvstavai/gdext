@@ -565,7 +565,10 @@ fn is_in_threaded_callback() -> bool {
 #[doc(hidden)]
 #[inline(always)]
 pub fn ensure_ordinary_callback_thread(explicitly_threaded_class: bool) {
-    if explicitly_threaded_class {
+    // Same-thread ordinary re-entry inherits the selected virtual's scoped permission. Check that
+    // first so the worker never initializes `std::thread::current()` through `is_main_thread()`;
+    // that runtime TLS cleanup could otherwise outlive a hot-reloaded Linux cdylib.
+    if explicitly_threaded_class && !is_in_threaded_callback() {
         ensure_ordinary_callback_thread_in(crate::is_main_thread());
     }
 }
@@ -585,8 +588,9 @@ mod ordinary_callback_thread_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        ThreadedCallbackAdmission, ensure_ordinary_callback_thread_in,
-        with_threaded_callback_admission_in, with_threaded_callback_scope,
+        ThreadedCallbackAdmission, ensure_ordinary_callback_thread,
+        ensure_ordinary_callback_thread_in, with_threaded_callback_admission_in,
+        with_threaded_callback_scope,
     };
 
     unsafe fn with_local_ordinary_admission<R>(
@@ -725,6 +729,24 @@ mod ordinary_callback_thread_tests {
 
         assert!(after_scope_result.is_err());
         assert_eq!(body_calls.load(Ordering::SeqCst), 1);
+        admission.close_and_wait();
+    }
+
+    #[test]
+    fn synchronous_reentry_skips_main_thread_runtime_tls() {
+        let admission = ThreadedCallbackAdmission::default();
+        admission.open();
+
+        unsafe {
+            with_threaded_callback_admission_in(&admission, |token| {
+                with_threaded_callback_scope(token, || {
+                    // Unit tests have no initialized Godot binding. Reaching `is_main_thread()`
+                    // would therefore panic, as well as initialize unload-unsafe runtime TLS.
+                    ensure_ordinary_callback_thread(true);
+                });
+            });
+        }
+
         admission.close_and_wait();
     }
 }

@@ -35,7 +35,9 @@ cleanup() {
     cleanedUp=1
     if [[ $godotPid -ne 0 ]] && kill -0 "$godotPid" 2>/dev/null; then
       echo "[Bash]      Kill Godot (PID $godotPid)..."
-      kill "$godotPid" || true # ignore errors here
+      kill "$godotPid" 2>/dev/null || true # ignore errors here
+      wait "$godotPid" 2>/dev/null || true
+      godotPid=0
     fi
     echo "[Bash]      Cleanup..."
     rm -f "$threadedReleaseFile" "$threadedStartedFile" "$threadedCompletedFile" "$threadedTimeoutFile"

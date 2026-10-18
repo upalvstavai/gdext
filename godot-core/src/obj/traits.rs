@@ -145,6 +145,9 @@ pub enum ClassThreading {
 ///   active during synchronous re-entry;
 /// - finish all work which relies on the callback's binding permission before returning. Permission is thread-local, is not inherited by
 ///   spawned threads, and does not cover deferred work or values whose safety depends on the callback after it returns;
+/// - in a reloadable Linux editor session, avoid `std::thread::current()` and other Rust runtime thread-local state with cleanup callbacks on
+///   engine-owned worker threads. Such cleanup can run after Godot unloads the extension library. The framework's callback admission and
+///   blocking storage use destructor-free thread identities, but cannot prevent user code or dependencies from initializing their own TLS;
 /// - ensure the engine stops dispatching new opted-in callbacks before extension deinitialization or library unload begins. Callbacks admitted
 ///   before shutdown are drained, but a new worker callback beginning after worker admission closes violates this contract and is rejected
 ///   fail-stop before its body runs. Main-thread callbacks remain available for synchronous deinitialization cleanup until final binding
